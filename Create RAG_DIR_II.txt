@@ -1,0 +1,44 @@
+rag_system/
+│
+├── adapter/
+│   ├── inbound/
+│   │   ├── http_router.py          # FastAPI routes → calls IngestPort / QueryPort
+│   │   └── cli.py                  # Typer / argparse entrypoint
+│   └── outbound/
+│       ├── file_loader.py          # FileLoaderAdapter  implements LoaderPort
+│       ├── faiss_store.py          # FaissStoreAdapter  implements VectorStorePort
+│       ├── local_embedder.py       # LocalEmbedder      implements EmbedPort
+│       └── local_llm.py            # LocalLLMAdapter    implements LLMPort
+│
+├── application/
+│   ├── port/
+│   │   ├── inbound/
+│   │   │   ├── ingest_port.py      # Protocol: ingest(paths) → None
+│   │   │   └── query_port.py       # Protocol: query(text)  → Answer
+│   │   └── outbound/
+│   │       ├── loader_port.py      # Protocol: load(path)   → list[Document]
+│   │       ├── embed_port.py       # Protocol: embed(texts) → list[Vector]
+│   │       ├── vector_store_port.py# Protocol: upsert / search
+│   │       └── llm_port.py         # Protocol: generate(prompt) → str
+│   └── usecase/
+│       ├── ingest_usecase.py       # load → chunk → embed → store
+│       └── query_usecase.py        # embed query → retrieve → build prompt → generate
+│
+├── domain/
+│   ├── model/
+│   │   ├── document.py             # @dataclass Document(id, content, metadata)
+│   │   ├── chunk.py                # @dataclass Chunk(id, doc_id, text, embedding)
+│   │   └── answer.py               # @dataclass Answer(text, sources)
+│   └── service/
+│       └── chunker.py              # pure fn: chunk(doc, size, overlap) → list[Chunk]
+│
+├── infrastructure/
+│   ├── config/
+│   │   └── settings.py             # pydantic-settings: index_path, model_name, chunk_size…
+│   ├── logging/
+│   │   └── logger.py               # structlog setup
+│   └── persistence/
+│       └── index_store.py          # save/load FAISS index + metadata JSON sidecar
+│
+└── bootstrap/
+    └── container.py                # builds all adapters, injects into use cases, mounts router
