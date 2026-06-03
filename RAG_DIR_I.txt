@@ -1,0 +1,69 @@
+src/
+│
+├── adapter/
+│   ├── inbound/
+│   │   ├── api/
+│   │   │   └── rag_controller.py
+│   │   └── cli/
+│   │       └── rag_cli.py
+│   │
+│   └── outbound/
+│       ├── llm/
+│       │   └── openai_llm_adapter.py
+│       │
+│       ├── vectorstore/
+│       │   ├── chroma_adapter.py
+│       │   ├── qdrant_adapter.py
+│       │   └── pgvector_adapter.py
+│       │
+│       ├── embedding/
+│       │   └── sentence_transformer_adapter.py
+│       │
+│       └── document/
+│           ├── pdf_loader_adapter.py
+│           └── filesystem_adapter.py
+│
+├── application/
+│   ├── port/
+│   │   ├── inbound/
+│   │   │   ├── ask_question_port.py
+│   │   │   ├── ingest_document_port.py
+│   │   │   └── search_context_port.py
+│   │   │
+│   │   └── outbound/
+│   │       ├── llm_port.py
+│   │       ├── embedding_port.py
+│   │       ├── vector_store_port.py
+│   │       └── document_loader_port.py
+│   │
+│   └── usecase/
+│       ├── ask_question_usecase.py
+│       ├── ingest_document_usecase.py
+│       └── search_context_usecase.py
+│
+├── domain/
+│   ├── model/
+│   │   ├── document.py
+│   │   ├── chunk.py
+│   │   ├── embedding.py
+│   │   ├── query.py
+│   │   └── retrieval_result.py
+│   │
+│   └── service/
+│       ├── chunking_service.py
+│       ├── ranking_service.py
+│       └── prompt_builder_service.py
+│
+├── infrastructure/
+│   ├── config/
+│   │   └── settings.py
+│   │
+│   ├── logging/
+│   │   └── logger.py
+│   │
+│   └── persistence/
+│       └── database.py
+│
+└── bootstrap/
+    └── container/
+        └── dependency_container.py
