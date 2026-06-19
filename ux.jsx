@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect } from "react";
+import ReactMarkdown from "react-markdown";
 
 const ENDPOINT = "http://localhost:8000/query";
 
@@ -153,9 +154,22 @@ function MessageBubble({ entry }) {
         <div className="px-4 py-3 rounded-2xl rounded-tl-sm bg-slate-800/70 border border-slate-700/50">
           {/* Main response */}
           {msg.response ? (
-            <p className="text-sm text-slate-100 leading-relaxed whitespace-pre-wrap">
-              {msg.response}
-            </p>
+            <div className="prose prose-sm prose-invert max-w-none
+              prose-p:text-slate-100 prose-p:leading-relaxed prose-p:my-1.5
+              prose-headings:text-slate-100 prose-headings:font-semibold prose-headings:mt-4 prose-headings:mb-1
+              prose-h1:text-base prose-h2:text-sm prose-h3:text-xs
+              prose-strong:text-slate-200 prose-strong:font-semibold
+              prose-em:text-slate-300
+              prose-code:text-sky-300 prose-code:bg-slate-900 prose-code:px-1.5 prose-code:py-0.5 prose-code:rounded prose-code:text-xs prose-code:font-mono prose-code:before:content-none prose-code:after:content-none
+              prose-pre:bg-slate-900 prose-pre:border prose-pre:border-slate-700/60 prose-pre:rounded-lg prose-pre:text-xs prose-pre:overflow-x-auto
+              prose-ul:text-slate-200 prose-ul:my-1.5 prose-ul:pl-4
+              prose-ol:text-slate-200 prose-ol:my-1.5 prose-ol:pl-4
+              prose-li:my-0.5 prose-li:marker:text-slate-500
+              prose-blockquote:border-l-sky-500 prose-blockquote:text-slate-400 prose-blockquote:bg-slate-900/40 prose-blockquote:px-3 prose-blockquote:py-1 prose-blockquote:rounded-r
+              prose-hr:border-slate-700
+              prose-a:text-sky-400 prose-a:no-underline hover:prose-a:underline">
+              <ReactMarkdown>{msg.response}</ReactMarkdown>
+            </div>
           ) : (
             <p className="text-sm text-slate-500 italic">No response.</p>
           )}
