@@ -1,0 +1,36 @@
+# 1. Create the Vite + React project
+npm create vite@latest rag-ui -- --template react
+
+# 2. Enter the project folder
+cd rag-ui
+
+# 3. Install base dependencies
+npm install
+
+# 4. Install Tailwind CSS (Vite plugin)
+npm install -D tailwindcss @tailwindcss/vite
+
+# 5. Install Tailwind typography plugin (for prose-* markdown classes)
+npm install -D @tailwindcss/typography
+
+# 6. Install react-markdown
+npm install react-markdown
+
+# 7. Start the dev server
+npm run dev
+
+vite.config.js
+import { defineConfig } from 'vite'
+import react from '@vitejs/plugin-react'
+import tailwindcss from '@tailwindcss/vite'
+
+export default defineConfig({
+  plugins: [react(), tailwindcss()],
+})
+
+src/index.css
+@import "tailwindcss";
+@plugin "@tailwindcss/typography";
+
+src/main.jsx
+import './index.css'
