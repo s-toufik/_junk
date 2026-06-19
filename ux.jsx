@@ -1,3 +1,19 @@
+---------------
+import './index.css'
+---------------
+@import "tailwindcss";  
+---------------
+import { defineConfig } from 'vite'
+import react from '@vitejs/plugin-react'
+import tailwindcss from '@tailwindcss/vite'
+
+export default defineConfig({
+  plugins: [
+    react(),
+    tailwindcss(),
+  ],
+})
+---------------
 import { useState, useRef, useEffect } from "react";
 
 const ENDPOINT = "http://localhost:8000/query"; // change to your FastAPI URL
