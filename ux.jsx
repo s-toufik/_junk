@@ -47,34 +47,66 @@ function ReasoningBlock({ text }) {
 }
 
 // ─── Sources ─────────────────────────────────────────────────────────────────
+function ChunkMetadata({ meta }) {
+  if (!meta || !Object.keys(meta).length) return null;
+  return (
+    <div className="flex flex-wrap gap-x-3 gap-y-1 mt-2">
+      {Object.entries(meta).map(([k, v]) => (
+        <span key={k} className="text-[10px] font-mono text-slate-600">
+          <span className="text-slate-500">{k} </span>
+          <span className="text-slate-400">{String(v)}</span>
+        </span>
+      ))}
+    </div>
+  );
+}
+
 function SourcesBlock({ sources }) {
   if (!sources?.length) return null;
   return (
     <Collapsible icon="⊞" label={`${sources.length} source${sources.length > 1 ? "s" : ""}`} iconColor="text-sky-400">
-      <ul className="divide-y divide-slate-800">
-        {sources.map((s, i) => (
-          <li key={i} className="px-4 py-2.5 space-y-0.5">
-            {s.title && (
-              <p className="text-xs text-slate-200 font-medium">{s.title}</p>
-            )}
-            {s.content && (
-              <p className="text-xs text-slate-500 leading-relaxed line-clamp-2">{s.content}</p>
-            )}
-            {s.score != null && (
-              <span className="inline-block text-[10px] font-mono text-emerald-400 border border-emerald-500/25 bg-emerald-500/10 px-1.5 py-0.5 rounded mt-1">
-                score {Number(s.score).toFixed(3)}
-              </span>
-            )}
-            {/* render any other string fields generically */}
-            {Object.entries(s)
-              .filter(([k]) => !["title", "content", "score"].includes(k))
-              .map(([k, v]) => (
-                <p key={k} className="text-[10px] font-mono text-slate-600">
-                  <span className="text-slate-500">{k} </span>{String(v)}
+      <ul className="divide-y divide-slate-800/80">
+        {sources.map((result, i) => {
+          const chunk = result.chunk ?? {};
+          const score = result.score;
+          return (
+            <li key={i} className="px-4 py-3 space-y-1.5">
+              {/* Header row: chunk id + score */}
+              <div className="flex items-center justify-between gap-3">
+                <div className="flex items-center gap-2 min-w-0">
+                  <span className="text-[10px] font-mono text-slate-600 shrink-0">#{i + 1}</span>
+                  {chunk.id && (
+                    <span className="text-[10px] font-mono text-slate-500 truncate">{chunk.id}</span>
+                  )}
+                </div>
+                {score != null && (
+                  <span className="shrink-0 text-[10px] font-mono text-emerald-400 border border-emerald-500/25 bg-emerald-500/10 px-1.5 py-0.5 rounded">
+                    {Number(score).toFixed(3)}
+                  </span>
+                )}
+              </div>
+
+              {/* Chunk text */}
+              {chunk.text && (
+                <p className="text-xs text-slate-300 leading-relaxed line-clamp-3">
+                  {chunk.text}
                 </p>
-              ))}
-          </li>
-        ))}
+              )}
+
+              {/* document_id + metadata */}
+              <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+                {chunk.document_id && (
+                  <span className="text-[10px] font-mono text-slate-600">
+                    <span className="text-slate-500">doc </span>
+                    <span className="text-sky-500/70">{chunk.document_id}</span>
+                  </span>
+                )}
+              </div>
+
+              <ChunkMetadata meta={chunk.metadata} />
+            </li>
+          );
+        })}
       </ul>
     </Collapsible>
   );
