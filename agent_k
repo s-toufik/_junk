@@ -1,0 +1,506 @@
+"""
+agent.py — ReAct Agent with LangGraph (OOP)
+============================================
+
+Graph nodes live as methods on `ReactGraph`, which owns the LLM and registry.
+`AskQuestionUseCase` is a thin use-case wrapper that drives the compiled graph.
+
+Layers
+------
+  ToolResult          – value object for tool output
+  Tool (ABC)          – contract every tool must satisfy
+  SqlTool / PythonTool – concrete tools
+  ToolRegistry        – tool lookup + schema export
+  AgentState          – LangGraph typed state
+  ReactGraph          – graph definition (nodes + routing as instance methods)
+  AskQuestionUseCase  – hexagonal use-case entry point
+  AgentResult         – return value of AskQuestionUseCase.ask()
+"""
+
+from __future__ import annotations
+
+import io
+import json
+import logging
+import re
+import sys
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Annotated, Any, Optional
+
+from langgraph.graph import END, StateGraph
+from langgraph.graph.message import add_messages
+from typing_extensions import TypedDict
+
+from application.port.outbound.ports import LlmPort, QueryExecutor, SchemaRepository
+from domain.service.sql_services import (
+    LimitInjectionService,
+    SqlValidationError,
+    SqlValidationService,
+)
+
+log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Domain types
+# ---------------------------------------------------------------------------
+
+class QueryStatus(Enum):
+    SUCCESS         = "success"
+    TOOL_ERROR      = "tool_error"
+    ITERATION_LIMIT = "iteration_limit"
+    PARSE_ERROR     = "parse_error"
+
+
+@dataclass
+class ToolResult:
+    """Value object returned by every tool execution."""
+
+    tool_name: str
+    success:   bool
+    data:      Any                    = None
+    error:     Optional[str]          = None
+    stdout:    Optional[str]          = None
+    metadata:  dict[str, Any]         = field(default_factory=dict)
+
+    def as_text(self) -> str:
+        if not self.success:
+            return f"[ERROR] {self.error}"
+        if self.data is None:
+            return "No data returned."
+        if isinstance(self.data, list) and self.data and isinstance(self.data[0], dict):
+            return self._tabulate(self.data)
+        if hasattr(self.data, "to_string"):   # pandas DataFrame
+            return self.data.to_string()
+        return str(self.data)
+
+    @staticmethod
+    def _tabulate(rows: list[dict]) -> str:
+        headers = list(rows[0].keys())
+        cells   = [[str(row.get(h, "")) for h in headers] for row in rows]
+        widths  = [
+            max(len(h), max((len(r[i]) for r in cells), default=0))
+            for i, h in enumerate(headers)
+        ]
+        fmt  = " | ".join(f"{{:<{w}}}" for w in widths)
+        sep  = "-+-".join("-" * w for w in widths)
+        return "\n".join([fmt.format(*headers), sep, *(fmt.format(*r) for r in cells)])
+
+
+# ---------------------------------------------------------------------------
+# Tool abstraction
+# ---------------------------------------------------------------------------
+
+class Tool(ABC):
+    """Abstract base for every agent tool."""
+
+    @property
+    @abstractmethod
+    def name(self) -> str: ...
+
+    @property
+    @abstractmethod
+    def description(self) -> str: ...
+
+    @property
+    @abstractmethod
+    def parameters(self) -> dict[str, Any]: ...
+
+    @abstractmethod
+    def execute(self, **kwargs: Any) -> ToolResult: ...
+
+    def schema(self) -> dict[str, Any]:
+        """OpenAI-compatible function schema."""
+        return {
+            "type": "function",
+            "function": {
+                "name":        self.name,
+                "description": self.description,
+                "parameters":  self.parameters,
+            },
+        }
+
+
+# ---------------------------------------------------------------------------
+# SQL tool
+# ---------------------------------------------------------------------------
+
+class SqlTool(Tool):
+    """Validates, limits, and executes SELECT queries."""
+
+    def __init__(
+        self,
+        executor:   QueryExecutor,
+        schema_repo: SchemaRepository,
+        validator:  Optional[SqlValidationService]  = None,
+        limiter:    Optional[LimitInjectionService] = None,
+        max_limit:  int = 10_000,
+    ) -> None:
+        self._executor    = executor
+        self._schema_repo = schema_repo
+        self._validator   = validator or SqlValidationService()
+        self._limiter     = limiter   or LimitInjectionService()
+        self._max_limit   = max_limit
+
+    @property
+    def name(self) -> str:
+        return "sql"
+
+    @property
+    def description(self) -> str:
+        return "Execute a SELECT SQL query against the database."
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "sql":    {"type": "string",  "description": "SELECT statement to run."},
+                "limit":  {"type": "integer", "minimum": 1,  "description": "Row cap."},
+                "offset": {"type": "integer", "minimum": 0,  "description": "Pagination offset."},
+            },
+            "required": ["sql"],
+        }
+
+    def execute(self, **kwargs: Any) -> ToolResult:
+        sql:    str           = kwargs.get("sql", "")
+        limit:  Optional[int] = kwargs.get("limit")
+        offset: int           = kwargs.get("offset", 0)
+
+        try:
+            validated = self._validator.validate(sql)
+        except SqlValidationError as exc:
+            return ToolResult(tool_name=self.name, success=False, error=f"Validation: {exc}")
+
+        final_sql = self._apply_limit(validated.normalised, limit, offset)
+
+        try:
+            result = self._executor.execute(final_sql)
+        except Exception as exc:
+            return ToolResult(tool_name=self.name, success=False, error=f"DB error: {exc}")
+
+        data = result.rows if hasattr(result, "rows") else result
+        return ToolResult(
+            tool_name=self.name,
+            success=True,
+            data=data,
+            metadata={"sql": final_sql, "row_count": len(data) if isinstance(data, list) else 0},
+        )
+
+    def _apply_limit(self, sql: str, limit: Optional[int], offset: int) -> str:
+        if limit is not None:
+            limit = min(limit, self._max_limit)
+            base  = re.sub(r"\s+LIMIT\s+\d+(\s+OFFSET\s+\d+)?", "", sql, flags=re.IGNORECASE)
+            return f"{base} LIMIT {limit}" + (f" OFFSET {offset}" if offset else "")
+        final, _ = self._limiter.apply(sql)
+        return final
+
+
+# ---------------------------------------------------------------------------
+# Python tool
+# ---------------------------------------------------------------------------
+
+_SAFE_BUILTINS: dict[str, Any] = {
+    n: getattr(__builtins__, n, None) or __builtins__[n]  # type: ignore[index]
+    for n in (
+        "abs", "all", "any", "bool", "dict", "enumerate", "float", "int",
+        "len", "list", "max", "min", "print", "range", "round", "set",
+        "sorted", "str", "sum", "tuple", "zip",
+    )
+}
+
+_ALLOWED_MODULES: dict[str, str] = {
+    "pandas": "pd", "numpy": "np", "matplotlib.pyplot": "plt",
+    "json": "json", "math": "math", "datetime": "datetime",
+    "re": "re", "statistics": "statistics", "collections": "collections",
+    "itertools": "itertools", "functools": "functools",
+}
+
+
+class PythonTool(Tool):
+    """Executes Python in a sandboxed namespace. Assign your result to `result`."""
+
+    @property
+    def name(self) -> str:
+        return "python"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Run Python for data analysis or computation. "
+            "Available: pandas (pd), numpy (np), matplotlib.pyplot (plt), math, re, statistics. "
+            "Assign the final value to `result`."
+        )
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {"code": {"type": "string", "description": "Python code to execute."}},
+            "required": ["code"],
+        }
+
+    def execute(self, **kwargs: Any) -> ToolResult:
+        code    = kwargs.get("code", "")
+        globals_: dict[str, Any] = {"__builtins__": _SAFE_BUILTINS}
+        for module, alias in _ALLOWED_MODULES.items():
+            try:
+                globals_[alias] = __import__(module)
+            except ImportError:
+                pass
+
+        stdout_buf = io.StringIO()
+        sys.stdout, old = stdout_buf, sys.stdout
+        try:
+            exec(code, globals_)  # noqa: S102
+            stdout = stdout_buf.getvalue()
+            data   = globals_.get("result") or globals_.get("df") or (stdout.strip() or None)
+            return ToolResult(tool_name=self.name, success=True, data=data, stdout=stdout)
+        except Exception as exc:
+            return ToolResult(
+                tool_name=self.name,
+                success=False,
+                error=str(exc),
+                stdout=stdout_buf.getvalue(),
+            )
+        finally:
+            sys.stdout = old
+
+
+# ---------------------------------------------------------------------------
+# Tool registry
+# ---------------------------------------------------------------------------
+
+class ToolRegistry:
+    """Holds all tools available to the agent."""
+
+    def __init__(self) -> None:
+        self._tools: dict[str, Tool] = {}
+
+    def register(self, tool: Tool) -> "ToolRegistry":
+        if tool.name in self._tools:
+            raise ValueError(f"Tool '{tool.name}' already registered.")
+        self._tools[tool.name] = tool
+        return self  # fluent
+
+    def get(self, name: str) -> Optional[Tool]:
+        return self._tools.get(name)
+
+    def schemas(self) -> list[dict[str, Any]]:
+        return [t.schema() for t in self._tools.values()]
+
+
+# ---------------------------------------------------------------------------
+# LangGraph state
+# ---------------------------------------------------------------------------
+
+class AgentState(TypedDict):
+    question:          str
+    schema:            str
+    tool_schemas:      str
+    messages:          Annotated[list[dict], add_messages]
+    collected_results: list[ToolResult]
+    final_answer:      Optional[str]
+    status:            str  # QueryStatus.value
+
+
+# ---------------------------------------------------------------------------
+# ReactGraph — all graph logic in one class
+# ---------------------------------------------------------------------------
+
+_SYSTEM_PROMPT = """\
+You are a data analyst assistant. Answer the user's question by using tools when needed.
+
+## Available tools
+{tool_schemas}
+
+## Database schema
+{schema}
+
+## Response format
+Reply with exactly one JSON object — no markdown, no surrounding prose.
+
+To call a tool:
+{{
+  "step_type": "TOOL_CALL",
+  "reasoning": "<why>",
+  "tool_name": "<name>",
+  "tool_args": {{...}}
+}}
+
+To give the final answer:
+{{
+  "step_type": "ANSWER",
+  "reasoning": "<how you reached this>",
+  "answer": "<final answer>"
+}}
+"""
+
+
+class ReactGraph:
+    """
+    Owns the LangGraph graph definition.
+
+    Instance methods serve as graph nodes; `route` is the conditional edge.
+    The compiled graph is exposed via the `compiled` property.
+    """
+
+    def __init__(self, llm: LlmPort, registry: ToolRegistry) -> None:
+        self._llm      = llm
+        self._registry = registry
+        self._compiled = self._build()
+
+    # ------------------------------------------------------------------
+    # Public
+    # ------------------------------------------------------------------
+
+    @property
+    def compiled(self):
+        return self._compiled
+
+    # ------------------------------------------------------------------
+    # Nodes
+    # ------------------------------------------------------------------
+
+    def plan(self, state: AgentState) -> dict:
+        """Ask the LLM what to do next (TOOL_CALL or ANSWER)."""
+        system   = _SYSTEM_PROMPT.format(tool_schemas=state["tool_schemas"], schema=state["schema"])
+        messages = [{"role": "system", "content": system}, *state["messages"]]
+        raw      = self._llm.generate(messages)
+
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if not match:
+            log.error("No JSON in LLM response: %s", raw)
+            return {
+                "messages":     [{"role": "assistant", "content": raw}],
+                "final_answer": raw,
+                "status":       QueryStatus.PARSE_ERROR.value,
+            }
+
+        return {"messages": [{"role": "assistant", "content": match.group()}]}
+
+    def act(self, state: AgentState) -> dict:
+        """Execute the tool requested by the LLM."""
+        payload   = json.loads(state["messages"][-1]["content"])
+        tool_name = payload.get("tool_name", "")
+        tool_args = payload.get("tool_args", {})
+
+        tool = self._registry.get(tool_name)
+        if tool is None:
+            msg = f"Unknown tool: {tool_name!r}"
+            log.warning(msg)
+            return {
+                "messages": [{"role": "user", "content": f"[TOOL ERROR] {msg}"}],
+                "status":   QueryStatus.TOOL_ERROR.value,
+            }
+
+        result  = tool.execute(**tool_args)
+        summary = f"[RESULT: {tool_name}]\n{result.as_text()}"
+        log.debug("Tool %r → success=%s", tool_name, result.success)
+
+        return {
+            "messages":          [{"role": "user", "content": summary}],
+            "collected_results": [*state["collected_results"], result],
+            "status":            QueryStatus.SUCCESS.value if result.success else QueryStatus.TOOL_ERROR.value,
+        }
+
+    # ------------------------------------------------------------------
+    # Routing
+    # ------------------------------------------------------------------
+
+    def route(self, state: AgentState) -> str:
+        """Edge: decide the next node based on the last message."""
+        last = state["messages"][-1]
+        if last["role"] == "assistant":
+            try:
+                step = json.loads(last["content"]).get("step_type", "").upper()
+                if step == "ANSWER":    return "end"
+                if step == "TOOL_CALL": return "act"
+            except json.JSONDecodeError:
+                return "end"
+        return "plan"  # tool result → plan again
+
+    # ------------------------------------------------------------------
+    # Graph wiring
+    # ------------------------------------------------------------------
+
+    def _build(self):
+        builder = StateGraph(AgentState)
+        builder.add_node("plan", self.plan)
+        builder.add_node("act",  self.act)
+        builder.set_entry_point("plan")
+        builder.add_conditional_edges("plan", self.route, {"act": "act", "end": END, "plan": "plan"})
+        builder.add_conditional_edges("act",  self.route, {"plan": "plan", "end": END, "act": "act"})
+        return builder.compile()
+
+
+# ---------------------------------------------------------------------------
+# Result + use case
+# ---------------------------------------------------------------------------
+
+@dataclass
+class AgentResult:
+    question:          str
+    final_answer:      Optional[str]
+    status:            QueryStatus
+    collected_results: list[ToolResult]
+    iterations:        int
+
+
+class AskQuestionUseCase:
+    """
+    Hexagonal use-case entry point.
+    Drives the ReactGraph and maps its final state to an AgentResult.
+    """
+
+    def __init__(
+        self,
+        llm:           LlmPort,
+        registry:      ToolRegistry,
+        schema_repo:   SchemaRepository,
+        max_iterations: int = 10,
+    ) -> None:
+        self._schema_repo  = schema_repo
+        self._max_iter     = max_iterations
+        self._tool_schemas = json.dumps(registry.schemas(), indent=2)
+        self._graph        = ReactGraph(llm, registry).compiled
+
+    def ask(self, question: str) -> AgentResult:
+        initial: AgentState = {
+            "question":          question,
+            "schema":            str(self._schema_repo.load_schema()),
+            "tool_schemas":      self._tool_schemas,
+            "messages":          [{"role": "user", "content": question}],
+            "collected_results": [],
+            "final_answer":      None,
+            "status":            QueryStatus.SUCCESS.value,
+        }
+
+        final: AgentState = self._graph.invoke(
+            initial,
+            config={"recursion_limit": self._max_iter * 2},
+        )
+
+        return AgentResult(
+            question=question,
+            final_answer=self._extract_answer(final),
+            status=QueryStatus(final.get("status", QueryStatus.SUCCESS.value)),
+            collected_results=final["collected_results"],
+            iterations=sum(1 for m in final["messages"] if m["role"] == "assistant"),
+        )
+
+    @staticmethod
+    def _extract_answer(state: AgentState) -> Optional[str]:
+        if state.get("final_answer"):
+            return state["final_answer"]
+        for msg in reversed(state["messages"]):
+            if msg["role"] == "assistant":
+                try:
+                    data = json.loads(msg["content"])
+                    if data.get("step_type", "").upper() == "ANSWER":
+                        return data.get("answer")
+                except json.JSONDecodeError:
+                    return msg["content"]
+        return None
