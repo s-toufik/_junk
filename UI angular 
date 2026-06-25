@@ -1,0 +1,333 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Analytics Agent — Preview</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<style>
+*, *::before, *::after { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; height: 100%; background: #0d0f14; }
+
+:root {
+  --bg:            #0d0f14;
+  --surface:       #13161e;
+  --surface-2:     #181c26;
+  --surface-3:     #1e2230;
+  --border:        #252a38;
+  --text-primary:  #e8eaf2;
+  --text-secondary:#9aa0b8;
+  --text-muted:    #5a6180;
+  --accent:        #5b8af5;
+  --accent-dim:    #3d5fb0;
+  --blue:          #5b8af5;
+  --purple:        #9b72f5;
+  --green:         #4ec994;
+  --red:           #f55b6e;
+  --font-sans:     'Inter', system-ui, sans-serif;
+  --font-mono:     'JetBrains Mono', monospace;
+}
+
+.shell {
+  display: flex; flex-direction: column; height: 100vh;
+  max-width: 900px; margin: 0 auto;
+  color: var(--text-primary); font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ── Header ── */
+.header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 0 2rem; height: 56px; border-bottom: 1px solid var(--border);
+  background: var(--surface); flex-shrink: 0;
+}
+.header__brand { display: flex; align-items: center; gap: .6rem; }
+.header__sigil { font-size: 1.25rem; color: var(--accent); }
+.header__name {
+  font-family: var(--font-mono); font-size: .9rem; font-weight: 600;
+  letter-spacing: .04em; color: var(--text-primary); text-transform: uppercase;
+}
+.header__meta { display: flex; align-items: center; gap: 1.5rem; }
+.header__model { font-family: var(--font-mono); font-size: .7rem; color: var(--text-muted); }
+.header__status {
+  display: flex; align-items: center; gap: .4rem;
+  font-family: var(--font-mono); font-size: .7rem; color: var(--green);
+}
+.dot {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: currentColor; animation: pulse 2s infinite;
+}
+
+/* ── Main ── */
+.main {
+  flex: 1; overflow-y: auto; padding: 0 1.5rem; scroll-behavior: smooth;
+}
+.main::-webkit-scrollbar { width: 6px; }
+.main::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+/* ── Thread ── */
+.thread { display: flex; flex-direction: column; gap: 1.75rem; padding: 2rem 0 1rem; }
+
+.msg__user, .msg__assistant {
+  display: flex; align-items: flex-start; gap: .75rem;
+}
+.msg__user { flex-direction: row-reverse; }
+
+.avatar {
+  font-family: var(--font-mono); font-size: .65rem; font-weight: 700;
+  padding: .3rem .4rem; border-radius: 4px; flex-shrink: 0;
+  line-height: 1; margin-top: 2px;
+}
+.avatar--user {
+  background: var(--surface-3); color: var(--text-muted);
+  border: 1px solid var(--border);
+}
+.avatar--agent {
+  background: color-mix(in srgb, var(--accent) 15%, transparent);
+  color: var(--accent); border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
+  font-size: .85rem;
+}
+
+.bubble {
+  max-width: 78%; border-radius: 8px; padding: .75rem 1rem;
+  font-size: .9rem; line-height: 1.65;
+}
+.bubble--user {
+  background: color-mix(in srgb, var(--accent) 12%, var(--surface-2));
+  border: 1px solid color-mix(in srgb, var(--accent) 25%, transparent);
+  color: var(--text-primary);
+}
+.bubble--agent {
+  background: var(--surface-2); border: 1px solid var(--border);
+  color: var(--text-primary);
+}
+.bubble p { margin: 0; white-space: pre-wrap; }
+
+.msg-meta { margin-top: .75rem; border-top: 1px solid var(--border); padding-top: .6rem; }
+.steps-toggle {
+  background: none; border: none; padding: 0; cursor: pointer;
+  color: var(--text-muted); font-family: var(--font-mono); font-size: .7rem;
+  letter-spacing: .04em; display: flex; align-items: center; gap: .3rem;
+}
+.steps-toggle:hover { color: var(--text-secondary); }
+
+/* ── Steps panel ── */
+.steps {
+  margin-top: .75rem; padding: .875rem 1rem;
+  background: var(--surface-3); border: 1px solid var(--border); border-radius: 6px;
+}
+.steps-label {
+  font-family: var(--font-mono); font-size: .65rem; text-transform: uppercase;
+  letter-spacing: .1em; color: var(--text-muted); margin: 0 0 .75rem 1.75rem;
+}
+.steps-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; }
+.step {
+  display: flex; align-items: flex-start; gap: .6rem;
+  position: relative; padding-bottom: .75rem;
+}
+.step:last-child { padding-bottom: 0; }
+.step-connector {
+  position: absolute; left: .72rem; top: 1.1rem; bottom: 0;
+  width: 1px; background: var(--border);
+}
+.step:last-child .step-connector { display: none; }
+.step-icon {
+  font-size: .85rem; line-height: 1.4; flex-shrink: 0;
+  width: 1.4rem; text-align: center; position: relative; z-index: 1;
+}
+.step-body { display: flex; flex-direction: column; gap: .15rem; min-width: 0; flex: 1; }
+.step-type {
+  font-family: var(--font-mono); font-size: .65rem;
+  text-transform: uppercase; letter-spacing: .1em; font-weight: 600;
+}
+.step-detail { font-size: .8rem; color: var(--text-secondary); line-height: 1.4; }
+.step-input {
+  font-family: var(--font-mono); font-size: .72rem; color: var(--text-muted);
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: 4px; padding: .4rem .6rem; margin: .25rem 0 0;
+  overflow-x: auto; white-space: pre-wrap; word-break: break-all; line-height: 1.5;
+}
+
+.step--plan .step-icon, .step--plan .step-type { color: var(--accent-dim); }
+.step--sql  .step-icon, .step--sql  .step-type { color: var(--blue); }
+.step--python .step-icon, .step--python .step-type { color: var(--purple); }
+.step--answer .step-icon, .step--answer .step-type { color: var(--green); }
+
+/* ── Footer ── */
+.footer {
+  flex-shrink: 0; padding: .75rem 1.5rem 1rem;
+  border-top: 1px solid var(--border); background: var(--surface);
+}
+.footer-hint {
+  font-size: .68rem; color: var(--text-muted); font-family: var(--font-mono);
+  margin: .4rem 0 0; text-align: center; letter-spacing: .02em;
+}
+.input-bar {
+  display: flex; align-items: flex-end; gap: .5rem;
+  background: var(--surface-2); border: 1px solid var(--border);
+  border-radius: 10px; padding: .5rem .5rem .5rem 1rem;
+  transition: border-color .15s;
+}
+.input-bar:focus-within { border-color: var(--accent); }
+.input-field {
+  flex: 1; background: none; border: none; color: var(--text-primary);
+  font-family: var(--font-sans); font-size: .9rem; line-height: 1.5;
+  resize: none; outline: none; min-height: 1.5rem;
+}
+.input-field::placeholder { color: var(--text-muted); }
+.input-actions { display: flex; align-items: center; gap: .35rem; flex-shrink: 0; }
+.btn-send {
+  width: 34px; height: 34px; border-radius: 7px; border: none;
+  background: var(--accent); color: #fff; font-size: 1rem; cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  transition: background .15s;
+}
+.btn-send:hover { background: #7aa1f7; }
+.btn-clear {
+  width: 28px; height: 28px; border-radius: 6px;
+  border: 1px solid var(--border); background: none; color: var(--text-muted);
+  font-size: .9rem; cursor: pointer; display: flex; align-items: center; justify-content: center;
+  transition: color .15s, border-color .15s;
+}
+.btn-clear:hover { color: var(--red); border-color: var(--red); }
+
+/* ── Typing indicator ── */
+.typing { display: inline-flex; gap: 4px; align-items: center; height: 1.2rem; }
+.typing span {
+  display: block; width: 6px; height: 6px; border-radius: 50%;
+  background: var(--text-muted); animation: bounce 1.2s infinite;
+}
+.typing span:nth-child(2) { animation-delay: .2s; }
+.typing span:nth-child(3) { animation-delay: .4s; }
+
+@keyframes bounce {
+  0%, 80%, 100% { transform: translateY(0); opacity: .4; }
+  40% { transform: translateY(-5px); opacity: 1; }
+}
+@keyframes pulse {
+  0%, 100% { opacity: 1; } 50% { opacity: .4; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .typing span, .dot { animation: none; }
+}
+</style>
+</head>
+<body>
+<div class="shell">
+
+  <!-- Header -->
+  <header class="header">
+    <div class="header__brand">
+      <span class="header__sigil">⬡</span>
+      <span class="header__name">Analytics Agent</span>
+    </div>
+    <div class="header__meta">
+      <span class="header__model">gpt-4o-mini · LangGraph ReAct</span>
+      <span class="header__status">
+        <span class="dot"></span>API online
+      </span>
+    </div>
+  </header>
+
+  <!-- Main thread -->
+  <main class="main">
+    <div class="thread">
+
+      <!-- User message -->
+      <div class="msg__user">
+        <span class="avatar avatar--user">you</span>
+        <div class="bubble bubble--user">Which product generated the most revenue?</div>
+      </div>
+
+      <!-- Assistant: answered with steps -->
+      <div class="msg__assistant">
+        <span class="avatar avatar--agent">⬡</span>
+        <div class="bubble bubble--agent">
+          <p>Widget A generated the most revenue at $4,290 across all regions (EMEA, AMER, and APAC), followed by Widget B at $3,700 and Widget C at $1,020.</p>
+          <div class="msg-meta">
+            <button class="steps-toggle" onclick="toggleSteps('s1', this)">
+              <span>▸</span> 3 steps · 3 rows
+            </button>
+            <div id="s1" class="steps" style="display:none">
+              <p class="steps-label">Reasoning trace</p>
+              <ol class="steps-list">
+                <li class="step step--plan">
+                  <span class="step-connector"></span>
+                  <span class="step-icon">◈</span>
+                  <div class="step-body">
+                    <span class="step-type">Plan</span>
+                    <span class="step-detail">decision=sql | Need to query sales data to aggregate revenue by product</span>
+                  </div>
+                </li>
+                <li class="step step--sql">
+                  <span class="step-connector"></span>
+                  <span class="step-icon">⬡</span>
+                  <div class="step-body">
+                    <span class="step-type">SQL</span>
+                    <span class="step-detail">3 rows returned</span>
+                    <pre class="step-input">SELECT product, SUM(amount) as total_revenue
+FROM sales
+GROUP BY product
+ORDER BY total_revenue DESC</pre>
+                  </div>
+                </li>
+                <li class="step step--answer">
+                  <span class="step-connector"></span>
+                  <span class="step-icon">◉</span>
+                  <div class="step-body">
+                    <span class="step-type">Answer</span>
+                    <span class="step-detail">Widget A generated the most revenue at $4,290…</span>
+                  </div>
+                </li>
+              </ol>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- User message 2 -->
+      <div class="msg__user">
+        <span class="avatar avatar--user">you</span>
+        <div class="bubble bubble--user">Now compute the percentage share for each product</div>
+      </div>
+
+      <!-- Assistant: loading -->
+      <div class="msg__assistant">
+        <span class="avatar avatar--agent">⬡</span>
+        <div class="bubble bubble--agent">
+          <span class="typing"><span></span><span></span><span></span></span>
+        </div>
+      </div>
+
+    </div>
+  </main>
+
+  <!-- Footer -->
+  <footer class="footer">
+    <div class="input-bar">
+      <textarea
+        class="input-field"
+        placeholder="Ask a question about your data…"
+        rows="1"
+      ></textarea>
+      <div class="input-actions">
+        <button class="btn-clear" title="Clear chat">⟳</button>
+        <button class="btn-send" title="Send">↑</button>
+      </div>
+    </div>
+    <p class="footer-hint">Enter to send · Shift+Enter for new line</p>
+  </footer>
+</div>
+
+<script>
+function toggleSteps(id, btn) {
+  const el = document.getElementById(id);
+  const open = el.style.display === 'none';
+  el.style.display = open ? 'block' : 'none';
+  btn.querySelector('span').textContent = open ? '▾' : '▸';
+}
+</script>
+</body>
+</html>
