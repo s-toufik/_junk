@@ -1,0 +1,357 @@
+Below is a single, self-contained Python script that implements the async hexagonal agent with LangGraph, LangChain, in‑memory checkpointing, and the four specified nodes. Simply copy and paste it into a file (e.g. agent.py), install the required packages, set your OPENAI_API_KEY, and run.
+
+```python
+"""
+Fully async hexagonal agent using LangGraph, LangChain, in-memory checkpoint,
+with Python & Oracle SQL (via sqlglot) executors.
+
+Install dependencies:
+    pip install langgraph langchain langchain-openai pydantic sqlglot
+
+Set your OpenAI API key:
+    export OPENAI_API_KEY=sk-...
+"""
+
+import asyncio
+import io
+import contextlib
+import traceback
+import json
+from typing import List, Dict, Any, Optional, Literal, AsyncIterable
+
+from pydantic import BaseModel, Field
+from langgraph.graph import StateGraph, END
+from langgraph.checkpoint.memory import MemorySaver
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import (
+    BaseMessage,
+    SystemMessage,
+    HumanMessage,
+    AIMessage,
+    ToolMessage,
+    trim_messages,
+)
+
+import sqlglot
+import sqlite3
+
+# ============================================================================
+# 1. DOMAIN MODELS (Pydantic)
+# ============================================================================
+
+class Message(BaseModel):
+    role: Literal["system", "user", "assistant", "tool"]
+    content: str
+    tool_call_id: Optional[str] = None
+    name: Optional[str] = None  # tool name when role == tool
+
+class OrchestrationDecision(BaseModel):
+    action: Literal["call_tool", "final_answer"]
+    tool_name: Optional[Literal["python_executor", "sql_executor"]] = None
+    tool_args: Optional[Dict[str, Any]] = None
+    final_message: Optional[str] = None
+
+class AgentState(BaseModel):
+    messages: List[Message] = Field(default_factory=list)
+    orchestration_decision: Optional[OrchestrationDecision] = None
+
+# ============================================================================
+# 2. PORTS (Abstract base classes)
+# ============================================================================
+
+class LLMPort:
+    async def ainvoke(self, messages: List[Message]) -> Message:
+        raise NotImplementedError
+
+    async def astream(self, messages: List[Message]) -> AsyncIterable[Message]:
+        raise NotImplementedError
+
+class ToolPort:
+    name: str
+    description: str
+
+    async def execute(self, args: dict) -> str:
+        raise NotImplementedError
+
+class MemoryTrimmerPort:
+    async def trim(self, messages: List[Message], max_tokens: int) -> List[Message]:
+        raise NotImplementedError
+
+# ============================================================================
+# 3. ADAPTERS
+# ============================================================================
+
+# ---------- 3a. LangChain LLM Adapter ----------
+class LangChainLLMAdapter(LLMPort):
+    def __init__(self, model: str = "gpt-4o", temperature: float = 0.0):
+        self._llm = ChatOpenAI(model=model, temperature=temperature)
+
+    async def ainvoke(self, messages: List[Message]) -> Message:
+        lc_msgs = self._to_langchain(messages)
+        resp = await self._llm.ainvoke(lc_msgs)
+        return Message(role="assistant", content=resp.content)
+
+    async def astream(self, messages: List[Message]) -> AsyncIterable[Message]:
+        lc_msgs = self._to_langchain(messages)
+        async for chunk in self._llm.astream(lc_msgs):
+            if chunk.content:
+                yield Message(role="assistant", content=chunk.content)
+
+    def _to_langchain(self, messages: List[Message]) -> List[BaseMessage]:
+        mapping = {
+            "system": lambda m: SystemMessage(content=m.content),
+            "user": lambda m: HumanMessage(content=m.content),
+            "assistant": lambda m: AIMessage(content=m.content),
+            "tool": lambda m: ToolMessage(
+                content=m.content,
+                tool_call_id=m.tool_call_id or "",
+                name=m.name
+            ),
+        }
+        return [mapping[m.role](m) for m in messages]
+
+# ---------- 3b. Python Executor Tool ----------
+class PythonExecutorTool(ToolPort):
+    name = "python_executor"
+    description = (
+        "Execute Python code. Input: JSON with key 'code'. "
+        "Returns stdout and stderr."
+    )
+
+    async def execute(self, args: dict) -> str:
+        code = args.get("code", "")
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                await asyncio.to_thread(exec, code, {"__builtins__": {}})
+        except Exception:
+            stderr.write(traceback.format_exc())
+        out = stdout.getvalue()
+        err = stderr.getvalue()
+        result = out + ("\n[stderr]\n" + err if err else "")
+        return result.strip() or "Code executed with no output."
+
+# ---------- 3c. SQL Executor Tool (Oracle → SQLite via sqlglot) ----------
+class SQLExecutorTool(ToolPort):
+    name = "sql_executor"
+    description = (
+        "Execute an Oracle SQL statement. Input: JSON with key 'query'. "
+        "Transpiles to SQLite and runs on an in‑memory database. "
+        "Returns query result or status."
+    )
+
+    def __init__(self):
+        self.conn = sqlite3.connect(":memory:")
+        self.conn.row_factory = sqlite3.Row
+
+    async def execute(self, args: dict) -> str:
+        oracle_sql = args.get("query", "")
+        try:
+            sqlite_sql = sqlglot.transpile(oracle_sql, read="oracle", write="sqlite")[0]
+        except Exception as e:
+            return f"SQL transpilation error: {e}"
+
+        try:
+            cur = self.conn.cursor()
+            cur.execute(sqlite_sql)
+            if sqlite_sql.strip().upper().startswith("SELECT"):
+                rows = cur.fetchall()
+                if not rows:
+                    return "Query returned no rows."
+                headers = [desc[0] for desc in cur.description]
+                result = [dict(zip(headers, row)) for row in rows]
+                return f"Result: {result}"
+            else:
+                self.conn.commit()
+                return f"Statement executed. Rows affected: {cur.rowcount}"
+        except Exception as e:
+            return f"Execution error: {e}"
+
+# ---------- 3d. LangChain Memory Trimmer ----------
+def _token_counter(messages: List[BaseMessage]) -> int:
+    # Rough heuristic: 4 characters per token
+    return sum(len(m.content) // 4 for m in messages)
+
+class LangChainMemoryTrimmer(MemoryTrimmerPort):
+    def __init__(self, max_tokens: int = 2000):
+        self.max_tokens = max_tokens
+
+    async def trim(self, messages: List[Message], max_tokens: int | None = None) -> List[Message]:
+        max_t = max_tokens or self.max_tokens
+        lc_msgs = [self._to_lc(m) for m in messages]
+        trimmed = trim_messages(
+            lc_msgs,
+            max_tokens=max_t,
+            token_counter=_token_counter,
+            strategy="last",
+            start_on="human",
+            include_system=True,
+        )
+        return [self._from_lc(m) for m in trimmed]
+
+    def _to_lc(self, m: Message) -> BaseMessage:
+        if m.role == "user":
+            return HumanMessage(content=m.content)
+        elif m.role == "assistant":
+            return AIMessage(content=m.content)
+        elif m.role == "system":
+            return SystemMessage(content=m.content)
+        else:  # tool
+            return ToolMessage(content=m.content, tool_call_id=m.tool_call_id or "", name=m.name)
+
+    def _from_lc(self, m: BaseMessage) -> Message:
+        if isinstance(m, HumanMessage):
+            return Message(role="user", content=m.content)
+        elif isinstance(m, AIMessage):
+            return Message(role="assistant", content=m.content)
+        elif isinstance(m, SystemMessage):
+            return Message(role="system", content=m.content)
+        else:  # ToolMessage
+            return Message(role="tool", content=m.content,
+                           tool_call_id=getattr(m, "tool_call_id", None),
+                           name=getattr(m, "name", None))
+
+# ============================================================================
+# 4. AGENT GRAPH (Application layer)
+# ============================================================================
+
+def build_agent_graph(
+    llm: LLMPort,
+    tools: Dict[str, ToolPort],
+    memory_trimmer: MemoryTrimmerPort,
+    max_tokens: int = 2000,
+):
+    async def memory_node(state: AgentState) -> AgentState:
+        trimmed = await memory_trimmer.trim(state.messages, max_tokens=max_tokens)
+        state.messages = trimmed
+        return state
+
+    async def orchestration_node(state: AgentState) -> AgentState:
+        system_prompt = (
+            "You are a helpful assistant with access to two tools:\n"
+            "1. python_executor – execute Python code.\n"
+            "2. sql_executor – execute Oracle SQL (transpiled to SQLite).\n\n"
+            "Decide whether you need to call a tool or answer directly. "
+            "Respond with a JSON object matching this exact schema:\n"
+            f"{OrchestrationDecision.schema_json(indent=2)}\n\n"
+            "Example tool call:\n"
+            '{"action": "call_tool", "tool_name": "sql_executor", "tool_args": {"query": "SELECT 1 FROM dual"}}\n\n'
+            "Final answer:\n"
+            '{"action": "final_answer", "final_message": "Here is the result..."}'
+        )
+        llm_input = [Message(role="system", content=system_prompt)] + state.messages
+        ai_msg = await llm.ainvoke(llm_input)
+        state.messages.append(ai_msg)
+
+        # Parse the structured decision
+        try:
+            decision = OrchestrationDecision.model_validate_json(ai_msg.content)
+        except Exception:
+            # Fallback: treat as final answer
+            decision = OrchestrationDecision(
+                action="final_answer",
+                final_message="I'm sorry, I couldn't parse the orchestration decision."
+            )
+        state.orchestration_decision = decision
+        return state
+
+    async def tools_node(state: AgentState) -> AgentState:
+        decision = state.orchestration_decision
+        if not decision or decision.action != "call_tool" or not decision.tool_name:
+            return state
+
+        tool = tools[decision.tool_name]
+        result = await tool.execute(decision.tool_args or {})
+        tool_msg = Message(
+            role="tool",
+            content=result,
+            name=decision.tool_name,
+            tool_call_id="dummy"  # not used for simple tools
+        )
+        state.messages.append(tool_msg)
+        return state
+
+    async def final_node(state: AgentState) -> AgentState:
+        decision = state.orchestration_decision
+        if decision and decision.action == "final_answer" and decision.final_message:
+            state.messages.append(Message(role="assistant", content=decision.final_message))
+        else:
+            state.messages.append(Message(role="assistant", content="I have no further response."))
+        return state
+
+    # Build the graph
+    builder = StateGraph(AgentState)
+    builder.add_node("memory", memory_node)
+    builder.add_node("orchestration", orchestration_node)
+    builder.add_node("tools", tools_node)
+    builder.add_node("final", final_node)
+
+    builder.set_entry_point("memory")
+    builder.add_edge("memory", "orchestration")
+
+    def route(state: AgentState) -> Literal["tools", "final"]:
+        decision = state.orchestration_decision
+        if decision and decision.action == "call_tool" and decision.tool_name in tools:
+            return "tools"
+        return "final"
+
+    builder.add_conditional_edges("orchestration", route)
+    builder.add_edge("tools", "memory")  # loop back to trim again
+    builder.add_edge("final", END)
+
+    memory_saver = MemorySaver()
+    return builder.compile(checkpointer=memory_saver)
+
+# ============================================================================
+# 5. MAIN
+# ============================================================================
+
+async def main():
+    # Instantiate adapters
+    llm = LangChainLLMAdapter(model="gpt-4o", temperature=0.0)
+    tools = {
+        "python_executor": PythonExecutorTool(),
+        "sql_executor": SQLExecutorTool(),
+    }
+    memory_trimmer = LangChainMemoryTrimmer(max_tokens=1500)
+
+    # Build the compiled agent graph
+    agent = build_agent_graph(llm, tools, memory_trimmer)
+
+    # Configuration for checkpointing (thread ID)
+    config = {"configurable": {"thread_id": "1"}}
+
+    # User query that will trigger tool calls
+    user_msg = Message(role="user", content="Create a table employees (id, name), insert a row with id=1 and name='Alice', then query it.")
+
+    initial_state = AgentState(messages=[user_msg])
+
+    print("--- AGENT START ---")
+    async for event in agent.astream(initial_state, config=config, stream_mode="values"):
+        last_msg = event["messages"][-1]
+        print(f"{last_msg.role:>10}: {last_msg.content[:300]}...")
+    print("--- AGENT END ---")
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+---
+
+Running the Script
+
+1. Install dependencies:
+   ```bash
+   pip install langgraph langchain langchain-openai pydantic sqlglot
+   ```
+2. Set your OpenAI API key (e.g., on Linux/macOS):
+   ```bash
+   export OPENAI_API_KEY="sk-..."
+   ```
+3. Run the script:
+   ```bash
+   python agent.py
+   ```
+
+The agent will use the OrchestrationNode to decide on a tool, the ToolsNode to execute it (Python or Oracle SQL transpiled to SQLite), the MemoryNode to trim conversation history, and the FinalNode to deliver the answer. Everything is fully async, OOP, and uses in‑memory checkpointing via LangGraph’s MemorySaver.
