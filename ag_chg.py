@@ -1,103 +1,78 @@
-"""
-===========================================================
-FULL LLM AGENT ARCHITECTURE (LangGraph + Reflection Loop)
-===========================================================
-
-FEATURES:
-✔ Hexagonal Tool Design
-✔ Pydantic v2 Tool Schemas
-✔ SQLGlot SQL Tool
-✔ Python Execution Tool
-✔ LangChain Tool Adapter
-✔ Tool Registry
-✔ Planner (sync + streaming)
-✔ Router
-✔ Executor
-✔ Memory Node (trim context)
-✔ Reflection Node (self-correction loop)
-✔ Final Node
-✔ LangGraph orchestration
-===========================================================
-"""
-
-# ============================================================
-# IMPORTS
-# ============================================================
-
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Literal
 
+import asyncio
+import json
 import sqlglot
 
 from pydantic import BaseModel, Field
+from typing_extensions import TypedDict
 
 from langchain_core.tools import BaseTool
 from langchain_core.messages import BaseMessage, AIMessage, ToolMessage
 from langchain_core.messages.utils import trim_messages
 
 from langgraph.graph import StateGraph, END
-from typing_extensions import TypedDict
 
 
 # ============================================================
 # STATE
 # ============================================================
 
-class AgentState(TypedDict):
+class AgentState(TypedDict, total=False):
     messages: List[BaseMessage]
-    reflection: Dict[str, Any] | None
+    reflection: Dict[str, Any]
+    answer: str
 
 
 # ============================================================
-# PYDANTIC TOOL SCHEMAS
+# SCHEMAS
 # ============================================================
 
 class SQLToolSchema(BaseModel):
-    query: str = Field(..., description="SQL query to execute")
+    query: str = Field(...)
 
 
 class PythonToolSchema(BaseModel):
-    code: str = Field(..., description="Python code to execute")
+    code: str = Field(...)
 
 
 class ReflectionDecisionSchema(BaseModel):
-    decision: str = Field(..., description="'ok' or 'retry'")
-    critique: str = Field(..., description="Why result is good or bad")
+    decision: Literal["ok", "retry"]
+    critique: str
 
 
 # ============================================================
-# TOOL PORT (HEXAGONAL CORE)
+# TOOL CORE (ASYNC CAPABLE)
 # ============================================================
 
 class ToolCapability(ABC):
 
     @property
     @abstractmethod
-    def name(self) -> str:
-        ...
+    def name(self) -> str: ...
 
     @property
     @abstractmethod
-    def description(self) -> str:
-        ...
+    def description(self) -> str: ...
 
     @property
     @abstractmethod
-    def args_schema(self):
-        ...
+    def args_schema(self): ...
 
     @abstractmethod
-    def execute(self, **kwargs) -> Any:
-        ...
+    async def execute(self, **kwargs) -> Any: ...
 
 
 # ============================================================
-# SQL TOOL
+# SQL TOOL (ASYNC SAFE)
 # ============================================================
 
 class SQLToolCapability(ToolCapability):
+
+    ALLOWED_STATEMENTS = {"select"}
 
     def __init__(self, database):
         self.database = database
@@ -108,31 +83,33 @@ class SQLToolCapability(ToolCapability):
 
     @property
     def description(self) -> str:
-        return "Execute SQL using AST validation (sqlglot)"
+        return "Async safe SQL execution (SELECT only)"
 
     @property
     def args_schema(self):
         return SQLToolSchema
 
-    def execute(self, **kwargs) -> Any:
-
+    async def execute(self, **kwargs) -> Any:
         query = kwargs["query"]
 
         ast = sqlglot.parse_one(query)
+        if ast.key.lower() not in self.ALLOWED_STATEMENTS:
+            raise ValueError("Only SELECT allowed")
 
         normalized = ast.sql(dialect="postgres")
 
-        return self.database.execute(normalized)
+        # assume DB is async-compatible
+        return await self.database.execute(normalized)
 
 
 # ============================================================
-# PYTHON TOOL
+# PYTHON TOOL (ASYNC SANDBOX VIA THREAD POOL)
 # ============================================================
 
 class PythonToolCapability(ToolCapability):
 
-    def __init__(self, safe: bool = True):
-        self.safe = safe
+    def __init__(self):
+        pass
 
     @property
     def name(self) -> str:
@@ -140,41 +117,32 @@ class PythonToolCapability(ToolCapability):
 
     @property
     def description(self) -> str:
-        return "Execute Python code"
+        return "Async sandboxed Python execution"
 
     @property
     def args_schema(self):
         return PythonToolSchema
 
-    def execute(self, **kwargs) -> Any:
-
+    async def execute(self, **kwargs) -> Any:
         code = kwargs["code"]
 
-        namespace = {}
+        def _run():
+            safe_builtins = {
+                "len": len,
+                "range": range,
+                "min": min,
+                "max": max,
+                "sum": sum,
+                "print": print,
+            }
 
-        exec(code, {}, namespace)
+            globals_dict = {"__builtins__": safe_builtins}
+            locals_dict = {}
 
-        return namespace
+            exec(code, globals_dict, locals_dict)
+            return locals_dict
 
-
-# ============================================================
-# LANGCHAIN ADAPTER
-# ============================================================
-
-class LangChainToolAdapter(BaseTool):
-
-    capability: ToolCapability
-
-    def __init__(self, capability: ToolCapability):
-        super().__init__(
-            name=capability.name,
-            description=capability.description,
-            args_schema=capability.args_schema,
-        )
-        self.capability = capability
-
-    def _run(self, **kwargs):
-        return self.capability.execute(**kwargs)
+        return await asyncio.to_thread(_run)
 
 
 # ============================================================
@@ -189,23 +157,19 @@ class ToolRegistry:
     def get(self, name: str) -> ToolCapability:
         return self.tools[name]
 
-    def langchain_tools(self):
-        return [LangChainToolAdapter(t) for t in self.tools.values()]
-
 
 # ============================================================
-# BASE NODE
+# NODES
 # ============================================================
 
 class Node(ABC):
-
     @abstractmethod
-    def __call__(self, state: AgentState) -> Dict[str, Any]:
+    async def __call__(self, state: AgentState) -> Dict[str, Any]:
         ...
 
 
 # ============================================================
-# PLANNER (SYNC)
+# PLANNER
 # ============================================================
 
 class PlannerNode(Node):
@@ -213,15 +177,13 @@ class PlannerNode(Node):
     def __init__(self, llm):
         self.llm = llm
 
-    def __call__(self, state: AgentState):
-
-        response = self.llm.invoke(state["messages"])
-
+    async def __call__(self, state: AgentState):
+        response = await self.llm.ainvoke(state["messages"])
         return {"messages": [response]}
 
 
 # ============================================================
-# PLANNER (STREAMING)
+# STREAMING PLANNER (ASYNC FIXED)
 # ============================================================
 
 class StreamingPlannerNode(Node):
@@ -229,38 +191,36 @@ class StreamingPlannerNode(Node):
     def __init__(self, llm):
         self.llm = llm
 
-    def __call__(self, state: AgentState):
+    async def __call__(self, state: AgentState):
 
         chunks = []
 
-        for c in self.llm.stream(state["messages"]):
+        async for c in self.llm.astream(state["messages"]):
             chunks.append(c)
             print(c.content, end="", flush=True)
 
-        return {"messages": [chunks[-1]]}
+        full = AIMessage(content="".join([c.content for c in chunks]))
+
+        return {"messages": [full]}
 
 
 # ============================================================
-# ROUTER
+# ROUTER (SINGLE SOURCE OF TRUTH)
 # ============================================================
 
 class RouterNode:
 
     def route(self, state: AgentState) -> str:
-
         last = state["messages"][-1]
 
-        if isinstance(last, AIMessage) and last.tool_calls:
+        if isinstance(last, AIMessage) and getattr(last, "tool_calls", None):
             return "tool"
-
-        if state.get("reflection") and state["reflection"]["decision"] == "retry":
-            return "planner"
 
         return "reflection"
 
 
 # ============================================================
-# EXECUTOR
+# EXECUTOR (ASYNC PARALLEL TOOL EXECUTION READY)
 # ============================================================
 
 class ExecutorNode(Node):
@@ -268,30 +228,31 @@ class ExecutorNode(Node):
     def __init__(self, registry: ToolRegistry):
         self.registry = registry
 
-    def __call__(self, state: AgentState):
+    async def __call__(self, state: AgentState):
 
         last = state["messages"][-1]
 
-        outputs = []
+        if not isinstance(last, AIMessage) or not getattr(last, "tool_calls", None):
+            return {"messages": []}
 
-        for call in last.tool_calls:
-
+        async def run_call(call):
             tool = self.registry.get(call["name"])
+            result = await tool.execute(**call["args"])
 
-            result = tool.execute(**call["args"])
-
-            outputs.append(
-                ToolMessage(
-                    content=str(result),
-                    tool_call_id=call["id"],
-                )
+            return ToolMessage(
+                content=str(result),
+                tool_call_id=call["id"],
             )
 
-        return {"messages": outputs}
+        results = await asyncio.gather(*[
+            run_call(call) for call in last.tool_calls
+        ])
+
+        return {"messages": list(results)}
 
 
 # ============================================================
-# MEMORY NODE (TRIM)
+# MEMORY
 # ============================================================
 
 class MemoryNode(Node):
@@ -300,7 +261,7 @@ class MemoryNode(Node):
         self.llm = llm
         self.max_tokens = max_tokens
 
-    def __call__(self, state: AgentState):
+    async def __call__(self, state: AgentState):
 
         trimmed = trim_messages(
             state["messages"],
@@ -316,7 +277,7 @@ class MemoryNode(Node):
 
 
 # ============================================================
-# REFLECTION NODE (SELF-CORRECTION LOOP)
+# REFLECTION
 # ============================================================
 
 class ReflectionNode(Node):
@@ -324,45 +285,26 @@ class ReflectionNode(Node):
     def __init__(self, llm):
         self.llm = llm
 
-    def __call__(self, state: AgentState):
+    async def __call__(self, state: AgentState):
 
         last = state["messages"][-1].content
 
         prompt = [
             *state["messages"],
-            AIMessage(content=f"""
-You are a reflection system.
-
-Evaluate the last answer:
-- correctness
-- completeness
-- tool usage
-
-Return STRICT JSON:
-{{
-  "decision": "ok" | "retry",
-  "critique": "..."
-}}
-
-ANSWER:
-{last}
-""")
+            AIMessage(content=json.dumps({
+                "answer": last,
+                "instruction": "evaluate correctness"
+            }))
         ]
 
-        result = self.llm.invoke(prompt)
-
-        import json
+        result = await self.llm.ainvoke(prompt)
 
         try:
             data = json.loads(result.content)
         except Exception:
             data = {"decision": "retry", "critique": "invalid format"}
 
-        decision = ReflectionDecisionSchema(**data)
-
-        return {
-            "reflection": decision.model_dump()
-        }
+        return {"reflection": ReflectionDecisionSchema(**data).model_dump()}
 
 
 # ============================================================
@@ -371,15 +313,12 @@ ANSWER:
 
 class FinalNode(Node):
 
-    def __call__(self, state: AgentState):
-
-        return {
-            "answer": state["messages"][-1].content
-        }
+    async def __call__(self, state: AgentState):
+        return {"answer": state["messages"][-1].content}
 
 
 # ============================================================
-# GRAPH BUILDER
+# GRAPH BUILDER (ASYNC READY)
 # ============================================================
 
 class AgentGraph:
@@ -408,11 +347,7 @@ class AgentGraph:
 
         graph = StateGraph(AgentState)
 
-        planner_node = (
-            self.streaming_planner
-            if self.use_streaming
-            else self.planner
-        )
+        planner_node = self.streaming_planner if self.use_streaming else self.planner
 
         graph.add_node("planner", planner_node)
         graph.add_node("executor", self.executor)
@@ -422,13 +357,13 @@ class AgentGraph:
 
         graph.set_entry_point("planner")
 
+        # SINGLE ROUTING PATH
         graph.add_conditional_edges(
             "planner",
             self.router.route,
             {
                 "tool": "executor",
                 "reflection": "reflection",
-                "planner": "planner",
             },
         )
 
@@ -447,57 +382,3 @@ class AgentGraph:
         graph.add_edge("final", END)
 
         return graph.compile()
-
-
-# ============================================================
-# EXAMPLE USAGE
-# ============================================================
-
-if __name__ == "__main__":
-
-    # ---------------- LLM MOCK ----------------
-    class MockLLM:
-        def invoke(self, x):
-            return AIMessage(content="final", tool_calls=[])
-
-        def stream(self, x):
-            for i in ["step1", "step2", "done"]:
-                yield AIMessage(content=i)
-
-    llm = MockLLM()
-
-    # ---------------- DB MOCK ----------------
-    class DB:
-        def execute(self, sql):
-            return f"executed: {sql}"
-
-    db = DB()
-
-    # ---------------- TOOLS ----------------
-    registry = ToolRegistry([
-        SQLToolCapability(db),
-        PythonToolCapability()
-    ])
-
-    # ---------------- NODES ----------------
-    planner = PlannerNode(llm)
-    streaming = StreamingPlannerNode(llm)
-    router = RouterNode()
-    executor = ExecutorNode(registry)
-    memory = MemoryNode(llm)
-    reflection = ReflectionNode(llm)
-    final = FinalNode()
-
-    # ---------------- GRAPH ----------------
-    app = AgentGraph(
-        planner,
-        streaming,
-        router,
-        executor,
-        memory,
-        reflection,
-        final,
-        use_streaming=True
-    ).build()
-
-    print("Agent built successfully")
