@@ -504,26 +504,82 @@ class ExecutorNode(Node):
 
 
 # ============================================================
-# MEMORY NODE  (async trim_messages)
+# OFFLINE TOKEN COUNTER
+# ============================================================
+
+class OfflineTokenCounter:
+    """
+    Counts tokens without any API call or network access.
+
+    Strategy (in priority order):
+      1. tiktoken  — exact BPE counts matching OpenAI models (cl100k_base).
+      2. Fallback  — len(text) // 4, the standard "4 chars ≈ 1 token" heuristic.
+
+    tiktoken is a pure-Python C-extension; it runs entirely offline once
+    the encoding file is cached locally (~1 MB, downloaded on first use).
+
+    LangChain's trim_messages accepts any callable
+        (list[BaseMessage]) -> int
+    so this class exposes __call__ with that exact signature.
+    """
+
+    def __init__(self, model: str = "gpt-4o") -> None:
+        self._enc = None
+        try:
+            import tiktoken
+            # cl100k_base is the encoding for gpt-4, gpt-4o, gpt-3.5-turbo
+            self._enc = tiktoken.encoding_for_model(model)
+        except (ImportError, KeyError):
+            # tiktoken not installed or unknown model — use char heuristic
+            pass
+
+    def count_text(self, text: str) -> int:
+        """Count tokens in a single string."""
+        if self._enc is not None:
+            return len(self._enc.encode(text, disallowed_special=()))
+        # fallback: 4 characters ≈ 1 token (OpenAI rule of thumb)
+        return max(1, len(text) // 4)
+
+    def __call__(self, messages: list) -> int:
+        """
+        Count total tokens across a list of BaseMessage objects.
+        Called by LangChain's trim_messages as token_counter=self.
+        Adds 4 tokens per message for role + formatting overhead
+        (matches OpenAI's chat-completion token accounting).
+        """
+        total = 0
+        for msg in messages:
+            content = msg.content if isinstance(msg.content, str) else str(msg.content)
+            total += self.count_text(content) + 4   # 4 = role + separators overhead
+        return total
+
+
+# ============================================================
+# MEMORY NODE  (fully offline — no LLM needed for trimming)
 # ============================================================
 
 class MemoryNode(Node):
     """
     Trims the conversation history to stay within the token budget.
-    Must be async because trim_messages with a model token-counter
-    may need to call the model's tokenizer asynchronously.
+
+    Uses OfflineTokenCounter so no API call is made during trimming.
+    trim_messages is called synchronously (it is not a coroutine when
+    token_counter is a plain callable rather than a model).
+    The __call__ is still async to satisfy the Node contract and keep
+    the graph fully async-compatible.
     """
 
-    def __init__(self, llm: Any, max_tokens: int = 8_000) -> None:
-        self._llm = llm
+    def __init__(self, max_tokens: int = 8_000, model: str = "gpt-4o") -> None:
         self._max_tokens = max_tokens
+        self._counter = OfflineTokenCounter(model=model)
 
     async def __call__(self, state: AgentState) -> dict[str, Any]:
-        from langchain_core.messages.utils import trim_messages
+        from langchain_core.messages import trim_messages
 
-        trimmed = await trim_messages(
+        # trim_messages is sync when token_counter is a callable (not a model)
+        trimmed = trim_messages(
             state["messages"],
-            token_counter=self._llm,
+            token_counter=self._counter,   # pure offline callable
             max_tokens=self._max_tokens,
             strategy="last",
             include_system=True,
@@ -681,6 +737,7 @@ def build_agent(
     max_tokens: int = 8_000,
     max_iterations: int = 10,
     use_streaming: bool = False,
+    llm_model: str = "gpt-4o",
 ) -> tuple[Any, dict]:
     """
     Wire all dependencies and return (compiled_graph, initial_state_template).
@@ -693,6 +750,7 @@ def build_agent(
     max_tokens     : memory trim budget in tokens
     max_iterations : hard cap on planner→executor cycles
     use_streaming  : use StreamingPlannerNode instead of PlannerNode
+    llm_model      : model name used by OfflineTokenCounter for tiktoken encoding
     """
     registry = ToolRegistry([
         SQLToolCapability(database, default_dialect=sql_dialect),
@@ -704,7 +762,7 @@ def build_agent(
         streaming_planner=StreamingPlannerNode(llm),
         router=RouterNode(),
         executor=ExecutorNode(registry),
-        memory=MemoryNode(llm, max_tokens=max_tokens),
+        memory=MemoryNode(max_tokens=max_tokens, model=llm_model),  # no llm needed
         reflection=ReflectionNode(llm),
         final=FinalNode(),
         use_streaming=use_streaming,
@@ -775,6 +833,7 @@ if __name__ == "__main__":
             max_tokens=8_000,
             max_iterations=10,
             use_streaming=False,
+            llm_model="gpt-4o",
         )
 
         state = {
