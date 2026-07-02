@@ -614,11 +614,11 @@ class ReflectionNode(Node):
     """
     Evaluates the last assistant answer using structured output.
 
-    Key fixes vs original:
-    • Uses llm.with_structured_output(ReflectionDecision) — no JSON parsing.
-    • The reflection prompt is sent as a separate one-shot call and does NOT
-      mutate the main message history (no history pollution).
-    • Max retries guard is enforced by the Router, not here.
+    On 'ok'    → only writes to state["reflection"]; messages unchanged.
+    On 'retry' → also appends a HumanMessage containing the critique so
+                 the planner sees exactly what was wrong on its next turn.
+                 Without this the planner would retry blind, with no
+                 knowledge of why it was asked to try again.
     """
 
     _SYSTEM = (
@@ -641,13 +641,27 @@ class ReflectionNode(Node):
             else "(no answer yet)"
         )
 
-        # One-shot call — does NOT append to state["messages"]
+        # One-shot evaluation call — isolated from main history
         decision: ReflectionDecision = await self._llm.ainvoke([
             self._system,
             HumanMessage(content=f"Evaluate this answer:\n\n{last_answer}"),
         ])
 
-        return {"reflection": decision.model_dump()}
+        update: dict[str, Any] = {"reflection": decision.model_dump()}
+
+        # Only on retry: inject the critique into the message history so
+        # the planner can read it on its next invocation.
+        if decision.should_retry:
+            feedback = HumanMessage(
+                content=(
+                    f"Your previous answer was not satisfactory.\n"
+                    f"Critique: {decision.critique}\n\n"
+                    f"Please try again, addressing the critique above."
+                )
+            )
+            update["messages"] = state["messages"] + [feedback]
+
+        return update
 
 
 # ============================================================
