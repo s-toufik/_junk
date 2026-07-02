@@ -11,13 +11,16 @@ FEATURES:
 ✔ Python Execution Tool          (subprocess sandbox, stdout captured)
 ✔ LangChain Tool Adapter         (correct Pydantic/BaseTool wiring)
 ✔ Tool Registry
-✔ Planner Node  (sync + streaming variants)
-✔ Router        (is a proper Node subclass)
-✔ Executor Node (concurrent async tool dispatch)
-✔ Memory Node   (async trim_messages)
-✔ Reflection Node  (structured output, no history pollution)
-✔ Final Node
-✔ Iteration guard (no infinite reflection loops)
+✔ Strict SRP per node:
+    PlannerNode    — calls LLM only, stores PlannerDecision in state
+    RouterNode     — reads last_node tag + state fields only, no message inspection
+    ExecutorNode   — converts PlannerDecision → ToolMessages, dispatches concurrently
+    MemoryNode     — trims messages only (offline token counter, no LLM)
+    ReflectionNode — calls LLM only, stores ReflectionDecision in state
+    FeedbackNode   — injects critique into messages when reflection says retry
+    FinalNode      — extracts final answer from state
+✔ last_node tag in AgentState    (router never inspects message types)
+✔ Iteration guard                (no infinite reflection loops)
 ✔ LangGraph async orchestration  (ainvoke / astream)
 ===========================================================
 """
@@ -28,26 +31,22 @@ from __future__ import annotations
 # STDLIB — allowed everywhere
 # ============================================================
 import asyncio
+import re as _re
 import textwrap
 from abc import ABC, abstractmethod
 from typing import Any, Optional
 
 # ============================================================
-# PYDANTIC — allowed everywhere (it is a data-validation lib,
-# not an AI framework)
+# PYDANTIC — allowed everywhere (data-validation lib, not AI framework)
 # ============================================================
 from pydantic import BaseModel, Field
 from typing_extensions import TypedDict
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  NOTE ON IMPORT DISCIPLINE
-#  The rule: langchain / langgraph / sqlglot imports are ONLY allowed in:
-#    • The adapter classes (LangChainToolAdapter, node implementations)
-#    • The graph builder (AgentGraph)
-#  They must NEVER appear in:
-#    • ToolCapability and its subclasses  (domain core)
-#    • Node ABC
-#    • AgentState TypedDict
+#  IMPORT DISCIPLINE
+#  langchain / langgraph / sqlglot imports are ONLY allowed inside the method
+#  or __init__ where they are used. They must NEVER appear at module top-level
+#  or inside ToolCapability subclasses / Node ABC / AgentState.
 # ──────────────────────────────────────────────────────────────────────────────
 
 
@@ -62,15 +61,19 @@ class AgentState(TypedDict):
     Fields
     ------
     messages        : full conversation history (LangChain BaseMessage objects)
-    reflection      : last ReflectionDecision, or None before first reflection
-    session_id      : unique per run — useful for logging / checkpointing
-    iteration       : how many planner→executor cycles have completed
-    max_iterations  : hard cap — prevents infinite reflection retry loops
-    final_answer    : populated by FinalNode; declared here so LangGraph
-                      keeps it in state (a key not declared is silently dropped)
+    planner_decision: last PlannerDecision dict, set by PlannerNode
+    reflection      : last ReflectionDecision dict, set by ReflectionNode
+    last_node       : name of the node that just wrote to state — the only
+                      signal RouterNode reads to decide the next step
+    session_id      : unique per run
+    iteration       : incremented by PlannerNode on every LLM call
+    max_iterations  : hard cap on planner→executor cycles
+    final_answer    : populated by FinalNode
     """
-    messages: list          # list[BaseMessage] — kept untyped to avoid import
+    messages: list
+    planner_decision: dict | None
     reflection: dict | None
+    last_node: str
     session_id: str
     iteration: int
     max_iterations: int
@@ -78,7 +81,7 @@ class AgentState(TypedDict):
 
 
 # ============================================================
-# PYDANTIC TOOL SCHEMAS  (pure Pydantic — no framework imports)
+# PYDANTIC TOOL SCHEMAS
 # ============================================================
 
 class SQLToolInput(BaseModel):
@@ -91,27 +94,19 @@ class PythonToolInput(BaseModel):
 
 
 # ============================================================
-# PYDANTIC LLM OUTPUT SCHEMAS  (used by structured_output)
+# PYDANTIC LLM OUTPUT SCHEMAS
 # ============================================================
-
-class ReflectionDecision(BaseModel):
-    decision: str = Field(..., description="'ok' to accept the answer, 'retry' to re-plan")
-    critique: str = Field(..., description="Explanation of why the answer is good or needs work")
-
-    @property
-    def should_retry(self) -> bool:
-        return self.decision.strip().lower() == "retry"
-
 
 class PlannerDecision(BaseModel):
     """
-    Structured output for the planner LLM.
-    The LLM either produces tool_calls or a final answer — never both.
+    Structured output returned by PlannerNode's LLM call.
+    Stored verbatim in state["planner_decision"] — no conversion in PlannerNode.
+    ExecutorNode reads it and converts it to ToolMessages.
     """
     reasoning: str = Field(..., description="Chain-of-thought before deciding")
     tool_calls: list[dict] = Field(
         default_factory=list,
-        description="List of {name, args} dicts for tools to invoke. Empty when answering directly.",
+        description="List of {name, args} dicts. Empty when answering directly.",
     )
     answer: Optional[str] = Field(
         None,
@@ -123,16 +118,27 @@ class PlannerDecision(BaseModel):
         return len(self.tool_calls) > 0
 
 
+class ReflectionDecision(BaseModel):
+    """
+    Structured output returned by ReflectionNode's LLM call.
+    Stored verbatim in state["reflection"] — no message mutation in ReflectionNode.
+    FeedbackNode reads it and decides whether to inject critique into messages.
+    """
+    decision: str = Field(..., description="'ok' to accept the answer, 'retry' to re-plan")
+    critique: str = Field(..., description="Explanation of why the answer is good or needs work")
+
+    @property
+    def should_retry(self) -> bool:
+        return self.decision.strip().lower() == "retry"
+
+
 # ============================================================
 # DOMAIN PORT — ToolCapability
 # (pure Python ABC — zero framework imports)
 # ============================================================
 
 class ToolCapability(ABC):
-    """
-    Hexagonal port: the domain's contract for any tool.
-    Concrete implementations know nothing about LangChain.
-    """
+    """Hexagonal port: domain contract for any tool."""
 
     @property
     @abstractmethod
@@ -148,21 +154,15 @@ class ToolCapability(ABC):
 
     @abstractmethod
     async def execute(self, **kwargs: Any) -> str:
-        """
-        All tools are async. Return a plain string result
-        so the adapter layer can wrap it in a ToolMessage.
-        """
+        """Execute and return a plain string — adapter wraps it in ToolMessage."""
 
 
 # ============================================================
-# SQL TOOL  (adapter — sqlglot import confined here)
+# SQL TOOL
 # ============================================================
 
 class SQLToolCapability(ToolCapability):
-    """
-    Validates SQL via sqlglot (Oracle dialect by default),
-    then delegates execution to the injected async database.
-    """
+    """Validates SQL via sqlglot (Oracle dialect), then executes via async DB."""
 
     def __init__(self, database: Any, default_dialect: str = "oracle") -> None:
         self._db = database
@@ -174,30 +174,22 @@ class SQLToolCapability(ToolCapability):
 
     @property
     def description(self) -> str:
-        return (
-            "Validate and execute a SQL query. "
-            "Defaults to Oracle dialect. "
-            "Pass dialect='sqlite' etc. to override."
-        )
+        return "Validate and execute SQL. Defaults to Oracle dialect."
 
     @property
     def args_schema(self) -> type[BaseModel]:
         return SQLToolInput
 
     async def execute(self, **kwargs: Any) -> str:
-        # sqlglot import confined to this adapter method
         import sqlglot
         import sqlglot.errors
 
         query: str = kwargs["query"]
         dialect: str = kwargs.get("dialect", self._default_dialect)
 
-        # ── 1. Parse & validate in source dialect ────────────────────────────
         try:
             statements = sqlglot.parse(
-                query,
-                dialect=dialect,
-                error_level=sqlglot.ErrorLevel.RAISE,
+                query, dialect=dialect, error_level=sqlglot.ErrorLevel.RAISE
             )
         except sqlglot.errors.SqlglotError as exc:
             return f"SQL validation error ({dialect}): {exc}"
@@ -205,14 +197,10 @@ class SQLToolCapability(ToolCapability):
         if not statements:
             return "SQL validation error: empty or unparseable query."
 
-        # ── 2. Transpile to execution dialect (sqlite for dev/test) ──────────
         transpiled = ";\n".join(
-            stmt.sql(dialect="sqlite")
-            for stmt in statements
-            if stmt is not None
+            stmt.sql(dialect="sqlite") for stmt in statements if stmt is not None
         )
 
-        # ── 3. Execute via injected async database ───────────────────────────
         try:
             result = await self._db.execute(transpiled)
             return str(result)
@@ -221,18 +209,14 @@ class SQLToolCapability(ToolCapability):
 
 
 # ============================================================
-# PYTHON TOOL  (subprocess sandbox — no exec())
+# PYTHON TOOL
 # ============================================================
 
 class PythonToolCapability(ToolCapability):
-    """
-    Executes Python code in an isolated subprocess.
-    Captures stdout; returns stderr on non-zero exit.
-    exec() is intentionally NOT used.
-    """
+    """Executes Python in a sandboxed subprocess — no exec()."""
 
-    _TIMEOUT: int = 10          # seconds
-    _MAX_OUTPUT: int = 4_000    # characters
+    _TIMEOUT: int = 10
+    _MAX_OUTPUT: int = 4_000
 
     @property
     def name(self) -> str:
@@ -251,7 +235,6 @@ class PythonToolCapability(ToolCapability):
         if not code:
             return "Error: no code provided."
 
-        # Wrap user code so runtime errors appear in stderr cleanly
         safe_code = textwrap.dedent(f"""
             import sys, traceback
             try:
@@ -298,32 +281,19 @@ class ToolRegistry:
             raise KeyError(f"No tool registered under name '{name}'.")
         return tool
 
-    def langchain_tools(self) -> list:
-        """Return LangChain-compatible wrappers for all registered tools."""
-        return [LangChainToolAdapter(t) for t in self._tools.values()]
-
     def all_tools(self) -> list[ToolCapability]:
         return list(self._tools.values())
 
 
 # ============================================================
 # LANGCHAIN TOOL ADAPTER
-# (LangChain import confined here — correct Pydantic wiring)
 # ============================================================
 
 class LangChainToolAdapter:
-    """
-    Wraps a ToolCapability as a LangChain-compatible tool.
-
-    We do NOT inherit BaseTool because BaseTool is a Pydantic BaseModel
-    and would reject a raw ToolCapability in its field validators.
-    Instead we expose the duck-typed interface LangGraph's ToolNode
-    expects: .name, .description, .args_schema, and async ainvoke().
-    """
+    """Duck-typed LangChain tool wrapper — does NOT inherit BaseTool."""
 
     def __init__(self, capability: ToolCapability) -> None:
         self._cap = capability
-        # Expose attributes LangGraph ToolNode reads
         self.name: str = capability.name
         self.description: str = capability.description
         self.args_schema: type[BaseModel] = capability.args_schema
@@ -331,20 +301,16 @@ class LangChainToolAdapter:
     async def ainvoke(self, input: dict, **_: Any) -> str:
         return await self._cap.execute(**input)
 
-    def invoke(self, input: dict, **_: Any) -> str:
-        # Sync shim for compatibility — runs the coroutine in the current loop
-        return asyncio.get_event_loop().run_until_complete(self._cap.execute(**input))
-
 
 # ============================================================
-# NODE BASE CLASS  (pure Python ABC)
+# NODE BASE CLASS
 # ============================================================
 
 class Node(ABC):
     """
     All graph nodes implement this contract.
-    Every node is async — it must not block the event loop.
-    Returns a partial AgentState dict (only keys that changed).
+    Returns a partial AgentState dict (only changed keys).
+    Every implementation must always set last_node to its own name.
     """
 
     @abstractmethod
@@ -352,62 +318,53 @@ class Node(ABC):
 
 
 # ============================================================
-# PLANNER NODE  (sync LLM call, structured output)
+# PLANNER NODE
+# Single responsibility: call the LLM, store the decision in state.
 # ============================================================
 
 class PlannerNode(Node):
     """
-    Asks the LLM what to do next via structured output.
-    The LLM returns a PlannerDecision — either tool calls or a final answer.
-    Uses LangChain structured output so there is NO manual JSON parsing.
+    Calls the LLM and stores the raw PlannerDecision in state.
+
+    SRP: this node does exactly one thing — invoke the LLM.
+    It does NOT convert the decision to AIMessage (ExecutorNode does that).
+    It does NOT decide where to go next (RouterNode does that).
+    It does NOT increment the iteration counter anywhere else — that is
+    its own state update, part of the LLM-call bookkeeping.
     """
 
     _SYSTEM = (
-        "You are an expert assistant. You have access to:\n"
+        "You are an expert assistant with access to:\n"
         "  • python_executor — runs Python code in a sandbox\n"
         "  • sql_executor    — validates + runs SQL (Oracle dialect)\n\n"
-        "Decide: call a tool, or answer directly. "
-        "Always fill `reasoning` first. "
-        "Never produce both tool_calls and answer simultaneously."
+        "Fill `reasoning` first. Then either populate `tool_calls` OR `answer` — never both."
     )
 
     def __init__(self, llm: Any) -> None:
-        # langchain import confined to adapter usage in __init__
         from langchain_core.messages import SystemMessage
         self._llm = llm.with_structured_output(PlannerDecision)
         self._system = SystemMessage(content=self._SYSTEM)
 
     async def __call__(self, state: AgentState) -> dict[str, Any]:
-        messages = [self._system, *state["messages"]]
-        decision: PlannerDecision = await self._llm.ainvoke(messages)
-
-        # Convert structured decision → AIMessage with optional tool_calls
-        from langchain_core.messages import AIMessage
-        if decision.wants_tools:
-            ai_msg = AIMessage(
-                content=decision.reasoning,
-                tool_calls=[
-                    {"id": f"call_{i}", "name": tc["name"], "args": tc.get("args", {})}
-                    for i, tc in enumerate(decision.tool_calls)
-                ],
-            )
-        else:
-            ai_msg = AIMessage(content=decision.answer or "")
-
+        decision: PlannerDecision = await self._llm.ainvoke(
+            [self._system, *state["messages"]]
+        )
         return {
-            "messages": state["messages"] + [ai_msg],
+            "planner_decision": decision.model_dump(),
             "iteration": state["iteration"] + 1,
+            "last_node": "planner",
         }
 
 
 # ============================================================
 # STREAMING PLANNER NODE
+# Single responsibility: stream LLM tokens, store raw response in state.
 # ============================================================
 
 class StreamingPlannerNode(Node):
     """
-    Streams tokens to stdout while accumulating the full response.
-    Falls back to PlannerNode structured output for the final message.
+    Streams tokens to stdout, stores the accumulated response in state.
+    Same SRP as PlannerNode — only the LLM call differs.
     """
 
     def __init__(self, llm: Any) -> None:
@@ -421,59 +378,75 @@ class StreamingPlannerNode(Node):
             chunks.append(chunk)
             if hasattr(chunk, "content") and chunk.content:
                 print(chunk.content, end="", flush=True)
-        print()  # newline after stream
+        print()
 
-        # Use the last chunk as the AIMessage (it has accumulated tool_calls)
         last = chunks[-1] if chunks else AIMessage(content="")
+        # Store as a minimal planner_decision so RouterNode can act uniformly
         return {
+            "planner_decision": {
+                "reasoning": "",
+                "tool_calls": getattr(last, "tool_calls", []) or [],
+                "answer": last.content if not getattr(last, "tool_calls", None) else None,
+            },
             "messages": state["messages"] + [last],
             "iteration": state["iteration"] + 1,
+            "last_node": "planner",
         }
 
 
 # ============================================================
-# ROUTER  (is a proper Node subclass)
+# ROUTER NODE
+# Single responsibility: read last_node + state fields, return next node name.
+# Zero message inspection. Zero LLM calls. Zero state mutation.
 # ============================================================
 
 class RouterNode(Node):
     """
-    Pure routing logic — reads state and returns the next node name.
-    Implements Node so it participates in the same OOP contract.
+    Decides the next node purely from state fields.
 
-    __call__ here is used as a LangGraph conditional-edge function,
-    so it returns a str (node name) rather than a state delta.
+    Routing table (keyed on last_node):
+    ┌──────────────┬────────────────────────────────────────────────────┐
+    │ last_node    │ logic                                              │
+    ├──────────────┼────────────────────────────────────────────────────┤
+    │ "planner"    │ wants_tools → executor  |  else → reflection       │
+    │ "feedback"   │ always → planner   (re-plan after critique)        │
+    │ "reflection" │ never reached here  (graph edge → feedback/final)  │
+    └──────────────┴────────────────────────────────────────────────────┘
+
+    Iteration cap is checked first regardless of last_node.
     """
 
     async def __call__(self, state: AgentState) -> str:  # type: ignore[override]
-        from langchain_core.messages import AIMessage
-
-        # Hard cap: if we've hit max_iterations, force final regardless
         if state["iteration"] >= state["max_iterations"]:
             return "final"
 
-        last = state["messages"][-1] if state["messages"] else None
+        last_node = state.get("last_node", "")
 
-        # Planner produced tool calls → execute them
-        if isinstance(last, AIMessage) and last.tool_calls:
-            return "executor"
+        if last_node == "planner":
+            decision = state.get("planner_decision") or {}
+            has_tools = bool(decision.get("tool_calls"))
+            return "executor" if has_tools else "reflection"
 
-        # Reflection says retry → re-plan
-        reflection = state.get("reflection")
-        if reflection and reflection.get("decision") == "retry":
+        if last_node == "feedback":
             return "planner"
 
-        # Otherwise → reflect on the answer before finalising
-        return "reflection"
+        # Fallback — should not be reached in normal flow
+        return "final"
 
 
 # ============================================================
-# EXECUTOR NODE  (concurrent async tool dispatch)
+# EXECUTOR NODE
+# Single responsibility: read PlannerDecision, run tools, append ToolMessages.
 # ============================================================
 
 class ExecutorNode(Node):
     """
-    Executes all pending tool calls concurrently via asyncio.gather().
-    Appends one ToolMessage per call to the message history.
+    Converts state["planner_decision"] into concurrent tool executions
+    and appends the results as ToolMessages + one AIMessage to history.
+
+    SRP: this node owns the tool-dispatch concern.
+    PlannerNode no longer builds AIMessage — that is done here so the
+    message history is only mutated in one place per tool-call cycle.
     """
 
     def __init__(self, registry: ToolRegistry) -> None:
@@ -482,14 +455,21 @@ class ExecutorNode(Node):
     async def __call__(self, state: AgentState) -> dict[str, Any]:
         from langchain_core.messages import AIMessage, ToolMessage
 
-        last = state["messages"][-1]
-        if not (isinstance(last, AIMessage) and last.tool_calls):
-            return {}   # nothing to do
+        decision_dict = state.get("planner_decision") or {}
+        tool_calls_raw: list[dict] = decision_dict.get("tool_calls", [])
+        reasoning: str = decision_dict.get("reasoning", "")
+
+        # Build the AIMessage that carries the tool_call references
+        lc_tool_calls = [
+            {"id": f"call_{i}", "name": tc["name"], "args": tc.get("args", {})}
+            for i, tc in enumerate(tool_calls_raw)
+        ]
+        ai_msg = AIMessage(content=reasoning, tool_calls=lc_tool_calls)
 
         async def _run_one(call: dict) -> ToolMessage:
             try:
                 tool = self._registry.get(call["name"])
-                result = await tool.execute(**call["args"])
+                result = await tool.execute(**call.get("args", {}))
             except KeyError:
                 result = f"Error: unknown tool '{call['name']}'."
             except Exception as exc:
@@ -497,95 +477,53 @@ class ExecutorNode(Node):
             return ToolMessage(content=result, tool_call_id=call["id"])
 
         tool_messages = await asyncio.gather(
-            *[_run_one(call) for call in last.tool_calls]
+            *[_run_one(c) for c in lc_tool_calls]
         )
 
-        return {"messages": state["messages"] + list(tool_messages)}
+        return {
+            "messages": state["messages"] + [ai_msg, *tool_messages],
+            "last_node": "executor",
+        }
 
 
 # ============================================================
-# OFFLINE TOKEN COUNTER
+# MEMORY NODE
+# Single responsibility: trim messages to fit the token budget.
 # ============================================================
-
-# ============================================================
-# APPROXIMATE TOKEN COUNTER  (pure stdlib — truly offline)
-# ============================================================
-
-import re as _re
-
 
 def _count_tokens(text: str) -> int:
     """
-    Approximate the number of BPE tokens in a string without any
-    external library or network access.
-
-    Algorithm
-    ---------
-    BPE tokenisers (GPT-2, cl100k_base) split on whitespace and
-    punctuation boundaries, then merge frequent byte pairs. A good
-    approximation without running the actual BPE algorithm is:
-
-      1. Split on whitespace → each word is roughly 1–2 tokens.
-      2. For each word, add 1 extra token per run of punctuation/digits
-         it contains (these tend to split off as separate tokens).
-      3. Add the fixed per-message overhead (role + framing = 4 tokens).
-
-    Accuracy: within ~10 % of cl100k_base on typical English prose,
-    code, and SQL — sufficient for a trim-budget guard.
-
-    No imports beyond stdlib `re`.
+    Approximate BPE token count using stdlib only.
+    Each whitespace-separated word = 1 token.
+    Each punctuation run inside a word = 1 extra token.
+    Accuracy: within ~10% of cl100k_base for prose, code, and SQL.
     """
     if not text:
         return 0
-
-    # Split into whitespace-separated words
-    words = text.split()
-    token_count = 0
-
-    for word in words:
-        # Base: every word is at least 1 token
-        token_count += 1
-        # Punctuation / digit runs inside a word tend to become extra tokens
-        # e.g. "don't" → ["don", "'", "t"] = 3 tokens
-        # e.g. "SELECT*FROM" → ["SELECT", "*", "FROM"] = 3 tokens
-        token_count += len(_re.findall(r"[^a-zA-Z0-9]+", word))
-
-    return token_count
+    count = 0
+    for word in text.split():
+        count += 1
+        count += len(_re.findall(r"[^a-zA-Z0-9]+", word))
+    return count
 
 
 def count_message_tokens(messages: list) -> int:
     """
-    Count approximate tokens for a list of LangChain BaseMessage objects.
-
-    LangChain's trim_messages accepts any callable with the signature
-        (list[BaseMessage]) -> int
-    so this function satisfies that contract directly.
-
-    Per-message overhead of 4 tokens accounts for the role label and
-    structural separators that chat-completion APIs add around each turn.
+    Callable compatible with trim_messages(token_counter=...).
+    4-token overhead per message matches OpenAI's chat-completion accounting.
     """
-    _OVERHEAD_PER_MESSAGE = 4
-    total = 0
-    for msg in messages:
-        content = msg.content if isinstance(msg.content, str) else str(msg.content)
-        total += _count_tokens(content) + _OVERHEAD_PER_MESSAGE
-    return total
+    return sum(
+        _count_tokens(
+            msg.content if isinstance(msg.content, str) else str(msg.content)
+        ) + 4
+        for msg in messages
+    )
 
-
-# ============================================================
-# MEMORY NODE  (fully offline — no LLM, no tiktoken)
-# ============================================================
 
 class MemoryNode(Node):
     """
-    Trims the conversation history to stay within the token budget.
-
-    Uses count_message_tokens() — a pure stdlib approximation with
-    zero external dependencies and zero network access.
-
-    trim_messages is synchronous when token_counter is a plain callable,
-    so no await is needed. __call__ remains async to satisfy the Node
-    contract and keep the graph fully async-compatible.
+    Trims state["messages"] to fit within max_tokens.
+    Uses count_message_tokens — no LLM, no network, no external deps.
     """
 
     def __init__(self, max_tokens: int = 8_000) -> None:
@@ -596,35 +534,40 @@ class MemoryNode(Node):
 
         trimmed = trim_messages(
             state["messages"],
-            token_counter=count_message_tokens,  # pure stdlib callable
+            token_counter=count_message_tokens,
             max_tokens=self._max_tokens,
             strategy="last",
             include_system=True,
             start_on="human",
             end_on=("human", "tool"),
         )
-        return {"messages": trimmed}
+        return {
+            "messages": trimmed,
+            "last_node": "memory",
+        }
 
 
 # ============================================================
-# REFLECTION NODE  (structured output, no history pollution)
+# REFLECTION NODE
+# Single responsibility: call the LLM, store ReflectionDecision in state.
 # ============================================================
 
 class ReflectionNode(Node):
     """
-    Evaluates the last assistant answer using structured output.
+    Calls the LLM to evaluate the last assistant answer.
+    Stores the raw ReflectionDecision in state["reflection"].
 
-    On 'ok'    → only writes to state["reflection"]; messages unchanged.
-    On 'retry' → also appends a HumanMessage containing the critique so
-                 the planner sees exactly what was wrong on its next turn.
-                 Without this the planner would retry blind, with no
-                 knowledge of why it was asked to try again.
+    SRP: this node only calls the LLM.
+    It does NOT inspect state["messages"] to mutate them.
+    It does NOT decide where to route next.
+    FeedbackNode owns the message-injection concern.
+    RouterNode (via graph edges from reflection) owns the routing concern.
     """
 
     _SYSTEM = (
-        "You are a self-correction system. "
-        "Evaluate the assistant's last answer for correctness and completeness. "
-        "Return decision='ok' if the answer is satisfactory, 'retry' if it needs improvement."
+        "You are a self-correction evaluator. "
+        "Assess the assistant's last answer for correctness and completeness. "
+        "Return decision='ok' if satisfactory, 'retry' if it needs improvement."
     )
 
     def __init__(self, llm: Any) -> None:
@@ -636,49 +579,89 @@ class ReflectionNode(Node):
         from langchain_core.messages import HumanMessage
 
         last_answer = (
-            state["messages"][-1].content
-            if state["messages"]
-            else "(no answer yet)"
+            state["messages"][-1].content if state["messages"] else "(no answer yet)"
         )
 
-        # One-shot evaluation call — isolated from main history
         decision: ReflectionDecision = await self._llm.ainvoke([
             self._system,
             HumanMessage(content=f"Evaluate this answer:\n\n{last_answer}"),
         ])
 
-        update: dict[str, Any] = {"reflection": decision.model_dump()}
+        return {
+            "reflection": decision.model_dump(),
+            "last_node": "reflection",
+        }
 
-        # Only on retry: inject the critique into the message history so
-        # the planner can read it on its next invocation.
-        if decision.should_retry:
-            feedback = HumanMessage(
-                content=(
-                    f"Your previous answer was not satisfactory.\n"
-                    f"Critique: {decision.critique}\n\n"
-                    f"Please try again, addressing the critique above."
-                )
+
+# ============================================================
+# FEEDBACK NODE
+# Single responsibility: inject critique into messages when retry is needed.
+# ============================================================
+
+class FeedbackNode(Node):
+    """
+    Reads state["reflection"] and appends a HumanMessage critique to
+    state["messages"] so the planner can see what was wrong.
+
+    SRP: this node owns exactly one concern — translating a ReflectionDecision
+    into a message the planner can act on.
+
+    It does NOT call any LLM.
+    It does NOT decide where to route (RouterNode reads last_node="feedback").
+    It is only reached when reflection.decision == "retry" (graph edge).
+    """
+
+    async def __call__(self, state: AgentState) -> dict[str, Any]:
+        from langchain_core.messages import HumanMessage
+
+        reflection = state.get("reflection") or {}
+        critique = reflection.get("critique", "No specific critique provided.")
+
+        feedback_msg = HumanMessage(
+            content=(
+                f"Your previous answer was not satisfactory.\n"
+                f"Critique: {critique}\n\n"
+                f"Please try again, addressing the critique above."
             )
-            update["messages"] = state["messages"] + [feedback]
+        )
 
-        return update
+        return {
+            "messages": state["messages"] + [feedback_msg],
+            "last_node": "feedback",
+        }
 
 
 # ============================================================
 # FINAL NODE
+# Single responsibility: extract final answer from state.
 # ============================================================
 
 class FinalNode(Node):
     """
-    Extracts the last assistant message as the final answer.
-    Writes to `final_answer` — a key declared in AgentState so
-    LangGraph does not silently discard it.
+    Reads the last message content and writes it to state["final_answer"].
+    If the planner produced a direct answer (no tools), also appends
+    an AIMessage so the history is complete.
     """
 
     async def __call__(self, state: AgentState) -> dict[str, Any]:
-        last = state["messages"][-1] if state["messages"] else None
+        from langchain_core.messages import AIMessage
+
+        decision = state.get("planner_decision") or {}
+        direct_answer = decision.get("answer")
+
+        messages = state["messages"]
+        if direct_answer:
+            ai_msg = AIMessage(content=direct_answer)
+            messages = messages + [ai_msg]
+
+        last = messages[-1] if messages else None
         answer = getattr(last, "content", "") or ""
-        return {"final_answer": answer}
+
+        return {
+            "messages": messages,
+            "final_answer": answer,
+            "last_node": "final",
+        }
 
 
 # ============================================================
@@ -689,67 +672,73 @@ class AgentGraph:
 
     def __init__(
         self,
-        planner: PlannerNode,
-        streaming_planner: StreamingPlannerNode,
+        planner: PlannerNode | StreamingPlannerNode,
         router: RouterNode,
         executor: ExecutorNode,
         memory: MemoryNode,
         reflection: ReflectionNode,
+        feedback: FeedbackNode,
         final: FinalNode,
-        use_streaming: bool = False,
     ) -> None:
         self._planner = planner
-        self._streaming_planner = streaming_planner
         self._router = router
         self._executor = executor
         self._memory = memory
         self._reflection = reflection
+        self._feedback = feedback
         self._final = final
-        self._use_streaming = use_streaming
 
     def build(self) -> Any:
         """
         Graph topology
         --------------
-        START
-          └─► planner ──[tool calls?]──► executor ──► memory ──► planner (loop)
-                      └─[no tools]────► reflection ──[ok]──────► final ──► END
-                                                    └─[retry]──► planner
+        START → planner → [router] → executor → memory → planner (tool loop)
+                                   → reflection → [ok]   → final → END
+                                                → [retry] → feedback → planner
         """
-        # langgraph import confined to graph builder
         from langgraph.graph import StateGraph, END
 
         graph = StateGraph(AgentState)
 
-        active_planner = self._streaming_planner if self._use_streaming else self._planner
-
-        graph.add_node("planner",    active_planner)
+        graph.add_node("planner",    self._planner)
         graph.add_node("executor",   self._executor)
         graph.add_node("memory",     self._memory)
         graph.add_node("reflection", self._reflection)
+        graph.add_node("feedback",   self._feedback)
         graph.add_node("final",      self._final)
 
         graph.set_entry_point("planner")
 
-        # Router is called as a conditional-edge function (returns a node name string)
+        # Router reads last_node from state — no message inspection
         graph.add_conditional_edges(
             "planner",
-            self._router,           # RouterNode.__call__ returns str — correct
+            self._router,
             {
                 "executor":   "executor",
                 "reflection": "reflection",
-                "final":      "final",    # hit when max_iterations reached mid-plan
-                "planner":    "planner",  # reflection retry re-enters planner
+                "final":      "final",
             },
         )
 
+        # Tool loop: executor → memory → planner → router
         graph.add_edge("executor", "memory")
         graph.add_edge("memory",   "planner")
 
+        # Reflection branch: router reads reflection.decision
         graph.add_conditional_edges(
             "reflection",
-            lambda s: "planner" if (s.get("reflection") or {}).get("decision") == "retry" else "final",
-            {"planner": "planner", "final": "final"},
+            lambda s: "feedback" if (s.get("reflection") or {}).get("decision") == "retry" else "final",
+            {"feedback": "feedback", "final": "final"},
+        )
+
+        # Feedback always re-enters planner via router (last_node="feedback")
+        graph.add_conditional_edges(
+            "feedback",
+            self._router,
+            {
+                "planner": "planner",
+                "final":   "final",   # iteration cap hit after feedback
+            },
         )
 
         graph.add_edge("final", END)
@@ -758,7 +747,7 @@ class AgentGraph:
 
 
 # ============================================================
-# FACTORY — single composition root
+# FACTORY
 # ============================================================
 
 def build_agent(
@@ -774,10 +763,10 @@ def build_agent(
 
     Parameters
     ----------
-    llm            : any LangChain chat model (ChatOpenAI, ChatAnthropic, …)
-    database       : object with async `execute(sql: str) -> Any` method
+    llm            : any LangChain chat model
+    database       : object with async execute(sql) method
     sql_dialect    : sqlglot source dialect (default "oracle")
-    max_tokens     : memory trim budget in tokens (approximated via count_message_tokens)
+    max_tokens     : memory trim budget (offline approximation)
     max_iterations : hard cap on planner→executor cycles
     use_streaming  : use StreamingPlannerNode instead of PlannerNode
     """
@@ -786,21 +775,24 @@ def build_agent(
         PythonToolCapability(),
     ])
 
+    planner = StreamingPlannerNode(llm) if use_streaming else PlannerNode(llm)
+
     graph = AgentGraph(
-        planner=PlannerNode(llm),
-        streaming_planner=StreamingPlannerNode(llm),
+        planner=planner,
         router=RouterNode(),
         executor=ExecutorNode(registry),
         memory=MemoryNode(max_tokens=max_tokens),
         reflection=ReflectionNode(llm),
+        feedback=FeedbackNode(),
         final=FinalNode(),
-        use_streaming=use_streaming,
     ).build()
 
     initial_state: AgentState = {
         "messages": [],
+        "planner_decision": None,
         "reflection": None,
-        "session_id": "",        # caller sets this per-run
+        "last_node": "",
+        "session_id": "",
         "iteration": 0,
         "max_iterations": max_iterations,
         "final_answer": None,
@@ -816,10 +808,7 @@ def build_agent(
 if __name__ == "__main__":
     import uuid
 
-    # ── Mock LLM ──────────────────────────────────────────────────────────────
     class MockStructuredLLM:
-        """Simulates a LangChain chat model with structured output support."""
-
         def __init__(self, schema: type[BaseModel] | None = None):
             self._schema = schema
 
@@ -829,26 +818,24 @@ if __name__ == "__main__":
         async def ainvoke(self, messages: list, **_: Any) -> Any:
             if self._schema is PlannerDecision:
                 return PlannerDecision(
-                    reasoning="The user asked a simple question I can answer directly.",
+                    reasoning="I can answer this directly.",
                     tool_calls=[],
                     answer="The answer is 42.",
                 )
             if self._schema is ReflectionDecision:
                 return ReflectionDecision(decision="ok", critique="Answer is correct.")
             from langchain_core.messages import AIMessage
-            return AIMessage(content="streamed response")
+            return AIMessage(content="mock response")
 
         async def astream(self, messages: list, **_: Any):
             from langchain_core.messages import AIMessage
-            for token in ["stream", "ed ", "ok"]:
+            for token in ["The ", "answer ", "is 42."]:
                 yield AIMessage(content=token)
 
-    # ── Mock Database ─────────────────────────────────────────────────────────
     class MockDB:
         async def execute(self, sql: str) -> str:
             return f"[mock result for: {sql[:60]}]"
 
-    # ── Wire & run ────────────────────────────────────────────────────────────
     async def main() -> None:
         from langchain_core.messages import HumanMessage
 
@@ -873,9 +860,10 @@ if __name__ == "__main__":
         result = await graph.ainvoke(state)
 
         print("\n=== AGENT RESULT ===")
-        print(f"Answer      : {result['final_answer']}")
-        print(f"Iterations  : {result['iteration']}")
-        print(f"Reflection  : {result['reflection']}")
+        print(f"Answer     : {result['final_answer']}")
+        print(f"Iterations : {result['iteration']}")
+        print(f"Reflection : {result['reflection']}")
+        print(f"Last node  : {result['last_node']}")
         print("Agent ran successfully ✓")
 
     asyncio.run(main())
