@@ -1,0 +1,14 @@
+"capabilities": {
+  "python": { "available": true, "tools": ["python_executor"] },
+  "files_read": { "available": true, "tools": ["file_reader"] },
+  "files_write": { "available": true, "tools": ["filewriter", "file_writer"] },
+  "service_db": { "available": false, "tools": ["users_tables"] },
+  "jira": { "available": true, "tools": ["*jira*"] },
+  "jira_write": { "available": false, "tools": ["create_jira", "update_jira_issue", "add_jira_comment", "transition_jira_issue", "duplicate_jira_issue", "link_jira_issues_to_epic", "log_jira_work"] },
+  "confluence": { "available": true, "tools": ["*confluence*"] },
+  "confluence_write": { "available": false, "tools": ["confluence_page", "manage_confluence_tags"] },
+  "bitbucket": { "available": true, "tools": ["*bitbucket*", "submit_merge_request", "get_commits_by_jira_key"] },
+  "oracle": { "available": true, "tools": ["*oracle_db"] },
+  "sql": { "available": true, "tools": ["sql_maestro_*"] },
+  "guardrail": { "available": true, "tools": [] }
+},
