@@ -12,3 +12,16 @@
   "sql": { "available": true, "tools": ["sql_maestro_*"] },
   "guardrail": { "available": true, "tools": [] }
 },
+
+
+uv run python -m agent_evaluation --kinds TOOL_SELECTION --runs 1
+uv run python -m agent_evaluation --kinds SECURITY --runs 1
+uv run python -m agent_evaluation --kinds GUARDRAIL --runs 1
+uv run python -m agent_evaluation --kinds TASK_COMPLETION --runs 1
+uv run python -m agent_evaluation --kinds MEMORY --runs 1
+uv run python -m agent_evaluation --kinds RELEVANCE --runs 1
+uv run python -m agent_evaluation --kinds PLANNING --runs 1
+uv run python -m agent_evaluation --kinds ROUTING --runs 1
+uv run python -m agent_evaluation --kinds QUALITY --runs 1
+
+uv run python -m agent_evaluation
