@@ -1,0 +1,1 @@
+kubectl exec -it <toolbox-pod> -- python -c "import httpx2; print(httpx2.get('<external-mcp-base-url>', timeout=10, trust_env=False))"
